@@ -1,6 +1,6 @@
 # Obvix Wellness (made by Obvix Labs)
 
-An experimental, safety-first emotional chat companion. Backend is a Flask API with lightweight RAG (MongoDB), a small router model for state analysis, and an Ollama-served local chat model. Trained adapters and a 4-bit quantized prototype are available on Hugging Face.
+An experimental, safety-first emotional chat companion. Backend is a Flask API with lightweight RAG (MongoDB), a Gemini 2.5 Flash router for state analysis and embeddings that support memories, and an Ollama-served local chat model. Trained adapters and a 4-bit quantized prototype are available on Hugging Face.
 
 Important: This prototype is not medical advice and not a replacement for professional care.
 
@@ -9,6 +9,7 @@ Important: This prototype is not medical advice and not a replacement for profes
 - Training notebook: training/trainijng gemma3.ipynb (LoRA with Unsloth, merge, and GGUF conversion flow).
 - Ollama Modelfile: training/Modelfile (prompt template + system message for local inference).
 - Env config: .env (set your own keys and endpoints).
+- External LLM: Gemini 2.5 Flash for routing (analysis JSON) and embeddings used by memories and state logic.
 
 ## Model artifacts
 - Hugging Face model repo (LoRA + GGUF prototype): https://hf.co/thtskaran/emoai
@@ -21,7 +22,7 @@ Prerequisites:
 - Python 3.10+
 - MongoDB (local or Atlas)
 - Ollama (for local inference): https://ollama.com
-- An OpenAI API key (for routing and embeddings)
+- A Google AI Studio API key (GEMINI_KEY) for routing and embeddings (Gemini 2.5 Flash + text-embedding-004)
 
 Install:
 - Create and fill a .env (example below).
@@ -30,7 +31,7 @@ Install:
 Environment (.env):
 - Do not commit secrets. Example:
   - MONGODB_URI=mongodb+srv://<user>:<pass>@<cluster>/<db>
-  - OPENAI_API_KEY=sk-...
+  - GEMINI_KEY=AIza...
   - OLLAMA_URL=http://localhost:11434
   - OLLAMA_MODEL=emoai-sarah
 
@@ -86,7 +87,8 @@ If you only want to infer locally:
 
 ## API architecture (high level)
 
-- Router (small OpenAI model) analyses user input → crisis flags, emotion/engagement, conversation mode, and memory updates.
+- Router (Gemini 2.5 Flash) analyzes user input → crisis flags, emotion/engagement, conversation mode, and memory updates.
+- External LLM usage: Offloaded tasks include routing/analysis JSON and embeddings that support memories (RAG) and FSM state tracking; chat generation remains local via Ollama.
 - FSMs:
   - DuoFSM: emotion (positive/neutral/negative) and engagement (engaged/withdrawn/looping/intimate).
   - ConversationFSM: casual_chat/light_support/deeper_exploration/skill_offering/crisis_support/cool_down/idle.
@@ -113,6 +115,7 @@ If you only want to infer locally:
 
 - Unsloth, TRL, Transformers, llama.cpp
 - Hugging Face Hub (hosting adapters and GGUF)
+- Google AI Studio (Gemini) for routing and embeddings
 - Community models used in prototyping
 
 ## Project

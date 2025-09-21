@@ -21,18 +21,20 @@ from werkzeug.exceptions import HTTPException
 # Load environment variables from a .env file (if present)
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OLLAMA_URL     = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
-MONGO_URI      = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
-DB_NAME        = os.getenv("MONGODB_DB", "emoai")
+# REPLACED: OpenAI key -> Gemini key
+GEMINI_KEY    = os.getenv("GEMINI_KEY")
+OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+MONGO_URI     = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
+DB_NAME       = os.getenv("MONGODB_DB", "emoai")
 # NEW: logging & debug config
 LOG_FILE       = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "logs.log"))
 PORT           = int(os.getenv("PORT", "5000"))
 FLASK_DEBUG    = os.getenv("FLASK_DEBUG", "1").strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
-EMBED_MODEL  = "text-embedding-3-small"   # OpenAI embeddings for RAG memories
-ROUTER_MODEL = "gpt-5-mini"               # Small OpenAI router that emits JSON analysis
-CHAT_MODEL   = "emoai-sarah"              # Local Ollama model for the actual companion chat
+# REPLACED: models to Gemini equivalents
+EMBED_MODEL   = "text-embedding-004"      # Gemini embeddings for RAG memories
+ROUTER_MODEL  = "gemini-2.5-flash"        # Gemini router that emits JSON analysis
+CHAT_MODEL    = "emoai-sarah"             # Local Ollama model for the actual companion chat
 
 # High-level conversation modes
 CONV_STATES = [
@@ -132,18 +134,24 @@ USER = {}  # user_id -> {"conversation": [...], "fsm": DuoFSM(), "conv": Convers
 # Utils
 # -------------------------
 
-def openai_headers():
-    if not OPENAI_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY required")
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-
 def get_embedding(text: str):
-    """Embed text using OpenAI embeddings for RAG retrieval."""
-    url = "https://api.openai.com/v1/embeddings"
-    resp = requests.post(url, headers=openai_headers(),
-                         json={"model": EMBED_MODEL, "input": [text]})
+    """Embed text using Gemini embeddings for RAG retrieval."""
+    if not GEMINI_KEY:
+        raise RuntimeError("GEMINI_KEY required")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:embedContent?key={GEMINI_KEY}"
+    payload = {
+        "content": {
+            "parts": [{"text": text}]
+        }
+    }
+    resp = requests.post(url, json=payload, timeout=45)
     resp.raise_for_status()
-    return resp.json()["data"][0]["embedding"]
+    data = resp.json()
+    # Gemini returns: {"embedding": {"values": [float,...]}}
+    emb = ((data or {}).get("embedding") or {}).get("values")
+    if not emb:
+        raise RuntimeError("embedding_failed")
+    return emb
 
 def cosine(a, b):
     dot = sum(x*y for x, y in zip(a, b))
@@ -300,12 +308,15 @@ ROUTER_SYS = (
 
 def call_router(user_id: str, user_message: str, last_states):
     """
-    Calls the small OpenAI router model to emit a canonical analysis JSON:
+    Calls the Gemini router model to emit a canonical analysis JSON:
     - crisis flag/type
     - FSM targets
     - memories (semantic/episodic/diff)
     - graph edges
     """
+    if not GEMINI_KEY:
+        raise RuntimeError("GEMINI_KEY required")
+
     sig = {}
     if sent_clf:
         try:
@@ -327,30 +338,38 @@ def call_router(user_id: str, user_message: str, last_states):
         except Exception:
             pass
 
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = openai_headers()
-    prompt = {
-        "role": "user",
-        "content": json.dumps({
-            "user_id": user_id,
-            "message": user_message,
-            "last_states": last_states,
-            "signals": sig
-        }, ensure_ascii=False)
-    }
+    # Gemini generateContent with systemInstruction and JSON-only output
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{ROUTER_MODEL}:generateContent?key={GEMINI_KEY}"
     body = {
-        "model": ROUTER_MODEL,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": ROUTER_SYS},
-            prompt
+        "systemInstruction": {
+            "parts": [{"text": ROUTER_SYS}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{
+                    "text": json.dumps({
+                        "user_id": user_id,
+                        "message": user_message,
+                        "last_states": last_states,
+                        "signals": sig
+                    }, ensure_ascii=False)
+                }]
+            }
         ],
-       
+        "generationConfig": {
+            "response_mime_type": "application/json",
+            "temperature": 0.2
+        }
     }
-    r = requests.post(url, headers=headers, json=body, timeout=45)
+    r = requests.post(url, json=body, timeout=45)
     r.raise_for_status()
-    obj = r.json()["choices"][0]["message"]["content"]
-    return json.loads(obj)
+    data = r.json()
+    try:
+        txt = data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception as e:
+        raise RuntimeError(f"router_parse_failed: {data}") from e
+    return json.loads(txt)
 
 # -------------------------
 # Crisis replies (warm, non-clinical)
