@@ -1,2 +1,3 @@
-/myenv
 .env
+/myenv
+client.json

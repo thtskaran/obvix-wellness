@@ -1,0 +1,20 @@
+# 1. Pull the model from your Hugging Face Hub repo
+FROM hf.co/thtskaran/emoai:latest
+
+# 2. Replicate the Alpaca-style prompt template you trained with
+TEMPLATE """{{ if .System }}### Instruction:
+{{ .System }}
+
+{{ end }}{{ if .Prompt }}### Input:
+{{ .Prompt }}
+
+{{ end }}### Response:
+"""
+
+# 3. Set your specific system message (taken from your provided JSON’s system key)
+SYSTEM """Sometimes we react to situations immediately, without thinking of the consequences of our actions. Typically by not reacting right away, we are better able to gather our thoughts, see the situation more clearly and from other perspectives, and respond more calmly. One of the strategies that almost always helps is deep breathing. When faced with a stressful situation, you can give yourself a time out by removing yourself from the stress and spend 5 minutes taking deep breaths (breathe in slowly counting to 4 and breathe out even slower counting to 6), while focusing and thinking only about your breathing. After doing so, think of the various ways you can respond to the situation and choose the one most appropriate. Good luck!"""
+
+# 4. Define stop tokens to prevent the model from rambling
+PARAMETER stop "### Instruction:"
+PARAMETER stop "### Input:"
+PARAMETER stop "### Response:"
