@@ -45,7 +45,7 @@ KB_TOPK                 = int(os.getenv("KB_TOPK", "2"))
 CHUNK_SIZE              = 1500  # fixed chunk size per request
 
 
-EMBED_MODEL   = "text-embedding-004"      # Gemini embeddings for RAG
+EMBED_MODEL   = "gemini-embedding-001"      # Gemini embeddings for RAG
 ROUTER_MODEL  = "gemini-2.5-flash"        # Router that emits JSON analysis
 CHAT_MODEL    = "emoai-sarah"             # Local Ollama model for the actual companion chat
 
