@@ -10,6 +10,7 @@ Important: This prototype is not medical advice and not a replacement for profes
 - Ollama Modelfile: training/Modelfile (prompt template + system message for local inference).
 - Env config: .env (set your own keys and endpoints).
 - External LLM: Gemini 2.5 Flash for routing (analysis JSON) and embeddings used by memories and state logic.
+- Google Drive KB: Sync a Drive folder of therapeutic texts (PDF, DOCX, MD, Google Docs) into a vector KB for lightweight grounding.
 
 ## Model artifacts
 - Hugging Face model repo (LoRA + GGUF prototype): https://hf.co/thtskaran/emoai
@@ -23,10 +24,12 @@ Prerequisites:
 - MongoDB (local or Atlas)
 - Ollama (for local inference): https://ollama.com
 - A Google AI Studio API key (GEMINI_KEY) for routing and embeddings (Gemini 2.5 Flash + text-embedding-004)
+- Google Drive read access via a Service Account (client.json in project root or set GOOGLE_CREDENTIALS_PATH)
 
 Install:
 - Create and fill a .env (example below).
 - pip install -U flask pymongo requests python-dotenv transitions transformers
+- pip install -U google-api-python-client google-auth google-auth-httplib2 python-docx pypdf
 
 Environment (.env):
 - Do not commit secrets. Example:
@@ -34,6 +37,10 @@ Environment (.env):
   - GEMINI_KEY=AIza...
   - OLLAMA_URL=http://localhost:11434
   - OLLAMA_MODEL=emoai-sarah
+  - GDRIVE_FOLDER_ID=your_drive_folder_id
+  - GOOGLE_CREDENTIALS_PATH=./client.json
+  - KB_TOPK=2
+  - KB_OVERLAP=200
 
 Run API:
 - python app.py
@@ -44,9 +51,34 @@ Example request:
 - JSON: { "user_id": "u1", "message": "rough day, feeling stuck" }
 - Response: { "message": "...", "meta": { "fsm": {...}, "conversation": "..." } }
 
-## Using the Ollama Modelfile
+## Google Drive Knowledge Base
 
-This repo includes training/Modelfile so you can create a local model:
+Purpose:
+- Maintain a global, non-clinical therapeutic corpus (e.g., CBT/DBT books, rulebooks, guidelines) for light grounding of the local 4B model.
+- The bot stays conversational and non-clinical; KB snippets are only used to keep language and facts steady.
+
+Setup:
+- Place your service account JSON at GOOGLE_CREDENTIALS_PATH (default ./client.json).
+- Share the Drive folder (GDRIVE_FOLDER_ID) with the service account email (Viewer).
+- Put text-friendly files in the folder: PDF, DOCX, MD/TXT, and Google Docs.
+  - No OCR is performed; files should be text-based.
+
+Real-time sync:
+- The server starts a background Drive Changes watcher on boot and keeps the KB in sync in near real time.
+- Changes in the configured folder (add/update/remove) automatically update MongoDB:
+  - kb_sources: one per Drive file
+  - kb_chunks: vector chunks (1500 chars, overlap controlled by KB_OVERLAP)
+- Everything from the files is chunked as-is (no stripping), then embedded with Gemini text-embedding-004.
+
+Manual full sync:
+- POST /kb/sync with optional JSON { "force": true } to reindex everything.
+
+Retrieval:
+- On each /chat call, the top KB snippets are added as short KB[...] lines in context (e.g., “KB[CBT_rulebook]: ...”).
+- The prompt explicitly instructs the model to remain non-clinical and to not cite sources.
+- Filenames matter. For example, “CBT_rulebook.pdf” implies CBT content (not DBT); this guides retrieval via title tags.
+
+## Using the Ollama Modelfile
 
 - ollama create emoai-sarah -f training/Modelfile
 - ollama run emoai-sarah
@@ -74,7 +106,6 @@ Important compatibility note:
 
 ## Merging and quantization (notebook flow)
 
-The notebook covers:
 - Loading a base model and training LoRA with Unsloth.
 - Merging LoRA into base weights (Peft merge_and_unload).
 - Converting merged HF weights to GGUF via llama.cpp.
@@ -95,7 +126,8 @@ If you only want to infer locally:
 - Memories:
   - Semantic (facts like name, preferences).
   - Episodic (short event summaries with embeddings).
-  - Diff logs (state changes).
+- Knowledge Base:
+  - Global KB from Drive (kb_sources, kb_chunks) with embeddings for lightweight grounding.
 - Local chat:
   - Prompt constructed with short context and minimal “benevolent friction”.
   - Served via Ollama model specified by OLLAMA_MODEL.
@@ -116,6 +148,7 @@ If you only want to infer locally:
 - Unsloth, TRL, Transformers, llama.cpp
 - Hugging Face Hub (hosting adapters and GGUF)
 - Google AI Studio (Gemini) for routing and embeddings
+- Google Drive API
 - Community models used in prototyping
 
 ## Project

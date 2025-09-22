@@ -1,6 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os, re, math, json, requests
 from datetime import datetime
 from flask import Flask, request, jsonify
@@ -9,34 +6,50 @@ from bson import ObjectId
 from transformers import pipeline
 from transitions import Machine
 from dotenv import load_dotenv
-# NEW: logging imports
+
+
 import logging
 from logging.handlers import RotatingFileHandler
 from werkzeug.exceptions import HTTPException
 
-# -------------------------
-# Environment & Config
-# -------------------------
 
-# Load environment variables from a .env file (if present)
+from io import BytesIO
+import tempfile
+import hashlib
+import threading
+import time
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
+from docx import Document
+from pypdf import PdfReader
+
+
 load_dotenv()
 
-# REPLACED: OpenAI key -> Gemini key
+
 GEMINI_KEY    = os.getenv("GEMINI_KEY")
 OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MONGO_URI     = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME       = os.getenv("MONGODB_DB", "emoai")
-# NEW: logging & debug config
 LOG_FILE       = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "logs.log"))
 PORT           = int(os.getenv("PORT", "5000"))
 FLASK_DEBUG    = os.getenv("FLASK_DEBUG", "1").strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
-# REPLACED: models to Gemini equivalents
-EMBED_MODEL   = "text-embedding-004"      # Gemini embeddings for RAG memories
-ROUTER_MODEL  = "gemini-2.5-flash"        # Gemini router that emits JSON analysis
+
+GDRIVE_FOLDER_ID        = os.getenv("GDRIVE_FOLDER_ID")
+GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", os.path.join(os.path.dirname(__file__), "client.json"))
+KB_OVERLAP              = int(os.getenv("KB_OVERLAP") or "0")
+KB_TOPK                 = int(os.getenv("KB_TOPK", "2"))
+CHUNK_SIZE              = 1500  # fixed chunk size per request
+
+
+EMBED_MODEL   = "text-embedding-004"      # Gemini embeddings for RAG
+ROUTER_MODEL  = "gemini-2.5-flash"        # Router that emits JSON analysis
 CHAT_MODEL    = "emoai-sarah"             # Local Ollama model for the actual companion chat
 
-# High-level conversation modes
+
 CONV_STATES = [
     "casual_chat",
     "light_support",
@@ -47,13 +60,14 @@ CONV_STATES = [
     "idle",
 ]
 
-# -------------------------
-# App & DB
-# -------------------------
 
 app = Flask(__name__)
+# Optional module logger for non-request helpers
+logger = logging.getLogger(__name__)
 
-# NEW: setup rotating file logging
+
+
+
 def setup_logging(flask_app: Flask):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) if os.path.dirname(LOG_FILE) else None
     handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3)
@@ -104,10 +118,11 @@ db = mc[DB_NAME]
 col_semantic  = db.semantic_memory   # user facts (name, prefs, relations, work)
 col_episodic  = db.episodic_memory   # high-level event summaries
 col_diff      = db.diff_memory       # state changes over time (emotion/engagement)
+# Knowledge base (global corpus)
+col_kb_src    = db.kb_sources        # records per Drive file
+col_kb        = db.kb_chunks         # chunked embeddings
+col_settings = db.settings           # generic settings (e.g., Drive changes page token)
 
-# -------------------------
-# Optional HF signals (sentiment/emotion/sarcasm)
-# -------------------------
 
 try:
     sent_clf = pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
@@ -186,7 +201,7 @@ def retrieve_memories(user_id: str, query_text: str, k=3):
         emostr = f" (felt {emo[0]})" if emo else ""
         ev_summaries.append(f"Previously: {ev.get('summary','')}{emostr}.")
 
-    # Semantic facts (lightweight, no regex extraction here)
+    # Semantic facts (lightweight)
     facts = []
     for f in col_semantic.find({"user_id": user_id}).limit(10):
         if f["type"] == "name":
@@ -207,6 +222,35 @@ def get_first_name(user_id: str):
         return None
     val = (doc.get("value") or "").strip()
     return val.split()[0] if val else None
+
+# -------------------------
+# KB retrieval (neutral, non-therapeutic)
+# -------------------------
+
+def retrieve_kb(query_text: str, k=2):
+    """
+    Retrieve up to k KB snippets by cosine similarity using stored embeddings.
+    Returns a list of small strings. Best-effort; safe to return [].
+    """
+    try:
+        qemb = get_embedding(query_text)
+    except Exception:
+        return []
+
+    # Only consider chunks that actually have embeddings
+    cur = col_kb.find({"embedding": {"$ne": None}}, {"text": 1, "embedding": 1}).limit(2000)
+    ranked = []
+    for doc in cur:
+        emb = doc.get("embedding")
+        if not emb:
+            continue
+        try:
+            score = cosine(qemb, emb)
+        except Exception:
+            score = 0.0
+        ranked.append((score, doc.get("text", "")[:400]))
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in ranked[:k]]
 
 # -------------------------
 # FSM (emotion + engagement)
@@ -292,8 +336,8 @@ class ConversationFSM:
 # -------------------------
 
 ROUTER_SYS = (
-    "You are a safety-first, grounded analysis router for an emotional AI companion. "
-    "You must return STRICT JSON ONLY with keys: "
+    "You are an analysis router for a friendly, grounded chat companion. "
+    "Return STRICT JSON ONLY with keys: "
     "{ 'crisis': {'flag': bool, 'type': 'none|suicidality|psychosis|abuse|dysregulation'}, "
     "'fsm': {'emotion':'neutral|positive|negative','engagement':'engaged|withdrawn|looping|intimate'}, "
     "'conversation': {'state':'casual_chat|light_support|deeper_exploration|skill_offering|crisis_support|cool_down|idle', 'confidence': number}, "
@@ -303,7 +347,7 @@ ROUTER_SYS = (
     "Rules: keep it minimal; summarize episodic at high level; include only key facts; "
     "set crisis true ONLY if the message indicates imminent risk; prefer 'none' otherwise; "
     "IF crisis.flag is true, set conversation.state='crisis_support'; "
-    "avoid romantic/parasocial attachments; avoid irreversible advice; reflect benevolent friction."
+    "avoid romantic/parasocial attachments; avoid irreversible advice."
 )
 
 def call_router(user_id: str, user_message: str, last_states):
@@ -372,46 +416,46 @@ def call_router(user_id: str, user_message: str, last_states):
     return json.loads(txt)
 
 # -------------------------
-# Crisis replies (warm, non-clinical)
+# Crisis replies (warm, non-clinical, no exercises)
 # -------------------------
 
 def crisis_reply(kind: str):
     if kind == "suicidality":
         return ("I'm really sorry you're feeling this much pain. You deserve support right now. "
                 "If you can, please reach out to someone you trust or a local crisis line. "
-                "I can sit with you for a moment—want to do a 10-second pause together?")
+                "I can stay with you in this chat while you consider that.")
     if kind == "psychosis":
-        return ("I'm sorry you're experiencing this. It might help to get medical support. "
-                "While you think about that, could we focus on what’s certain around you for a moment?")
+        return ("I'm sorry you're going through this. It may help to get medical support. "
+                "If you can, consider contacting someone you trust or local services. I'm here to listen.")
     if kind == "abuse":
-        return ("I'm so sorry you're going through that. You don’t deserve to be hurt. "
-                "If you're able, consider contacting trusted people or local services for safety. "
-                "We can take one tiny step together if you'd like.")
+        return ("I'm so sorry you're dealing with that. You don’t deserve to be hurt. "
+                "If you're able, reaching out to trusted people or local services could help. "
+                "I'm here with you.")
     if kind == "dysregulation":
-        return ("I can feel how intense this is. Let’s slow it down for a minute. "
-                "Want a quick breathing check-in while you line up support?")
-    return ("I'm here with you. You’re not alone, and it’s okay to ask for help close to you right now.")
-
+        return ("I can tell this feels intense. I'm here with you. "
+                "If talking it through helps, we can take it one small step at a time.")
+    return ("I'm here with you. You're not alone, and it's okay to ask for help close to you right now.")
 
 # -------------------------
 
 def build_companion_prompt(user_id, user_message, analysis_json, memories_for_prompt, convo_tail):
     """
     Build a prompt that asks the Ollama chat model to return exactly one short chat message as JSON.
-    Tone: casual, warm, grounded, non-clinical, with benevolent friction used sparingly.
+    Tone: friendly, grounded, non-clinical. No unsolicited techniques or advice.
     """
     persona = (
         "You are Emo AI — a grounded, everyday chat companion (not a clinician). "
-        "Sound like a caring friend, not a therapist. Keep it short and natural. "
-        "Avoid canned phrases (e.g., 'let's take a moment', 'it might help to'). "
-        "Use benevolent friction when useful (brief reflect, one small clarify, or a tiny next step). "
-        "No romance/parasocial vibes. Never give irreversible advice."
+        "Sound like a caring friend. Keep it short and natural. "
+        "Do NOT suggest techniques, exercises, or action steps unless the user explicitly asks. "
+        "Stay on the user's topic; be concise and real."
     )
 
     fsm = analysis_json.get("fsm", {})
     conv = (analysis_json.get("conversation", {}) or {}).get("state", "casual_chat")
-    ctx = [f"Emotion={fsm.get('emotion','neutral')}, Engagement={fsm.get('engagement','engaged')}.",
-           f"Mode={conv.upper()}."]
+    ctx = [
+        f"Emotion={fsm.get('emotion','neutral')}, Engagement={fsm.get('engagement','engaged')}.",
+        f"Mode={conv.upper()}."
+    ]
     for line in memories_for_prompt[:2]:
         ctx.append(line)
 
@@ -422,15 +466,11 @@ def build_companion_prompt(user_id, user_message, analysis_json, memories_for_pr
         "OUTPUT FORMAT: Return STRICT JSON exactly in this shape (and nothing else): "
         "{\"message\": \"...\"}. "
         "A single short string in 'message'. "
-        "No other keys. No markdown/code fences. No 'speaker' or 'role' fields. "
-        "No prefixes like 'EmoAI:' in the string. "
-        "STYLE: Warm, succinct, human. Max one gentle question. "
-        "Suggest a tiny next step only if it fits, phrased casually (e.g., 'want to try a 10-sec pause?'). "
-        "Avoid clinical words ('CBT', 'exercise', 'grounding technique'). "
-        "If FirstName exists, use it once. "
-        "Mode guidance: if Mode=SKILL_OFFERING, ask consent before one practical tip; "
-        "if Mode=CASUAL_CHAT, keep it light and friendly; "
-        "if Mode=CRISIS_SUPPORT, be safety-first and very brief."
+        "No other keys. No markdown/code fences. No prefixes like 'EmoAI:'. "
+        "STYLE: Warm, succinct, human. "
+        "Ask at most one brief clarifying question only if it's necessary to respond helpfully. "
+        "Do NOT propose coping strategies, breathing, grounding, journaling, routines, or any how-to advice unless the user asked. "
+        "If Mode=CRISIS_SUPPORT, be very brief and compassionate."
     )
 
     tail = ""
@@ -593,7 +633,7 @@ def chat():
         "conversation": state["conv"].conversation_state
     }
 
-    # 1) Router LLM → analysis JSON (no regex; safety-first)
+    # 1) Router LLM → analysis JSON
     try:
         analysis = call_router(user_id, user_msg, last_states)
         app.logger.info(f"router_ok uid={user_id} conv_target={(analysis.get('conversation',{}) or {}).get('state')}")
@@ -639,7 +679,7 @@ def chat():
     fsm = analysis.get("fsm", {})
     state["fsm"].apply(fsm.get("emotion", "neutral"), fsm.get("engagement", "engaged"))
 
-    # New: Apply ConversationFSM (with crisis override) and log diff
+    # Apply ConversationFSM (with crisis override) and log diff
     prev_conv = state["conv"].conversation_state
     conv_target = ((analysis.get("conversation", {}) or {}).get("state") or "casual_chat")
     if analysis.get("crisis", {}).get("flag"):
@@ -679,6 +719,13 @@ def chat():
     # 5) Build grounded prompt & query Ollama
     mem_lines = retrieve_memories(user_id, user_msg, k=3)
 
+    # Bring in a couple of relevant KB snippets (neutral KB)
+    try:
+        kb_lines = retrieve_kb(user_msg, k=KB_TOPK)
+    except Exception:
+        kb_lines = []
+    mem_lines = (kb_lines[:KB_TOPK]) + mem_lines
+
     # last 2 exchanges for continuity
     tail = []
     conv = state["conversation"]
@@ -715,11 +762,252 @@ def chat():
     })
 
 # -------------------------
+# Knowledge Base: Google Drive sync and retrieval
+# -------------------------
+
+def build_drive_service():
+    """Create a Drive API client using service account credentials."""
+    if not GDRIVE_FOLDER_ID:
+        raise RuntimeError("GDRIVE_FOLDER_ID not set")
+    if not os.path.isfile(GOOGLE_CREDENTIALS_PATH):
+        raise RuntimeError(f"Missing Google credentials file at {GOOGLE_CREDENTIALS_PATH}")
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    creds = service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS_PATH, scopes=scopes)
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+def list_drive_files(service, folder_id):
+    """List files in a Drive folder (no trashed)."""
+    files = []
+    page_token = None
+    q = f"'{folder_id}' in parents and trashed=false"
+    fields = "nextPageToken, files(id,name,mimeType,modifiedTime,md5Checksum,size)"
+    while True:
+        resp = service.files().list(q=q, fields=fields, pageToken=page_token).execute()
+        files.extend(resp.get("files", []))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return files
+
+def download_drive_file_text(service, file_id, mime_type):
+    """Download a Drive file and return UTF-8 text (no OCR)."""
+    # Google Docs → export as text/plain
+    if mime_type == "application/vnd.google-apps.document":
+        data = service.files().export(fileId=file_id, mimeType="text/plain").execute()
+        return data.decode("utf-8", errors="ignore")
+
+    # Binary files → get_media
+    req = service.files().get_media(fileId=file_id)
+    buf = BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    data = buf.getvalue()
+
+    if mime_type in ("text/markdown", "text/plain"):
+        return data.decode("utf-8", errors="ignore")
+
+    if mime_type in ("application/pdf",):
+        try:
+            reader = PdfReader(BytesIO(data))
+            txt = []
+            for page in reader.pages:
+                t = page.extract_text() or ""
+                if t:
+                    txt.append(t)
+            return "\n".join(txt)
+        except Exception:
+            return ""
+
+    if mime_type in ("application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/msword"):
+        try:
+            doc = Document(BytesIO(data))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception:
+            return ""
+
+    # Fallback attempt
+    try:
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+def chunk_text(text, max_chars=1800, overlap=200):
+    """Simple char-based chunking with overlap."""
+    text = (text or "")
+    if not text:
+        return []
+    chunks, i, n = [], 0, len(text)
+    while i < n:
+        j = min(i + max_chars, n)
+        chunks.append(text[i:j])
+        if j == n:
+            break
+        i = max(0, j - overlap)
+    return chunks
+
+def title_tags(title: str):
+    """Derive light tags from title (e.g., words >=3 chars)."""
+    t = (title or "").strip().lower()
+    parts = re.split(r"[\s_\-\.\(\)\[\]:]+", t)
+    parts = [p for p in parts if p]
+    return list({p for p in parts if len(p) >= 3})
+
+def upsert_kb_for_file(file_meta, text):
+    """Upsert chunks for a single Drive file into Mongo KB."""
+    fid = file_meta["id"]
+    title = file_meta.get("name", "")
+    mime  = file_meta.get("mimeType", "")
+    mtime = file_meta.get("modifiedTime", "")
+    content_hash = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+    src = col_kb_src.find_one({"file_id": fid})
+    if src and src.get("modifiedTime") == mtime and src.get("content_hash") == content_hash:
+        return {"status": "skip", "file_id": fid, "title": title}
+
+    # Remove old chunks if any
+    col_kb.delete_many({"source_id": fid})
+
+    # Chunk + embed
+    chunks = chunk_text(text, max_chars=CHUNK_SIZE, overlap=KB_OVERLAP)
+    tags = title_tags(title)
+    now = datetime.utcnow()
+    for idx, ch in enumerate(chunks):
+        try:
+            emb = get_embedding(ch)
+        except Exception:
+            emb = None
+        doc = {
+            "source_id": fid,
+            "title": title,
+            "mimeType": mime,
+            "chunk_index": idx,
+            "text": ch,
+            "embedding": emb,
+            "tags": tags,
+            "time": now
+        }
+        col_kb.insert_one(doc)
+
+    col_kb_src.update_one(
+        {"file_id": fid},
+        {"$set": {
+            "file_id": fid,
+            "title": title,
+            "mimeType": mime,
+            "modifiedTime": mtime,
+            "content_hash": content_hash,
+            "chunk_count": len(chunks),
+            "tags": tags,
+            "time": now
+        }},
+        upsert=True
+    )
+    return {"status": "updated", "file_id": fid, "title": title, "chunks": len(chunks)}
+
+def delete_kb_for_file(file_id: str):
+    """Remove KB records for a removed/trashed file."""
+    col_kb.delete_many({"source_id": file_id})
+    col_kb_src.delete_one({"file_id": file_id})
+
+# -------------------------
+# Drive Changes watcher
+# -------------------------
+
+def _settings_get(key, default=None):
+    doc = col_settings.find_one({"_id": key})
+    return (doc or {}).get("val", default)
+
+def _settings_set(key, val):
+    col_settings.update_one(
+        {"_id": key},
+        {"$set": {"val": val, "time": datetime.utcnow()}},
+        upsert=True
+    )
+
+def get_drive_start_page_token(service):
+    """Fetch current Drive start page token."""
+    res = service.changes().getStartPageToken().execute()
+    return res.get("startPageToken")
+
+def watch_drive_changes_loop():
+    """Background loop: poll Drive Changes API and keep KB in sync in near real time."""
+    if not GDRIVE_FOLDER_ID:
+        logger.warning("Drive watcher disabled: GDRIVE_FOLDER_ID not set")
+        return
+    try:
+        service = build_drive_service()
+    except Exception:
+        logger.exception("Drive watcher: failed to build service")
+        return
+
+    token_key = "drive_changes_start_page_token"
+    page_token = _settings_get(token_key)
+    if not page_token:
+        try:
+            page_token = get_drive_start_page_token(service)
+            _settings_set(token_key, page_token)
+            logger.info(f"Drive watcher: initialized start page token {page_token}")
+        except Exception:
+            logger.exception("Drive watcher: failed to get start page token")
+            return
+
+    fields = "newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,md5Checksum,trashed))"
+    while True:
+        try:
+            pt = page_token
+            while pt:
+                resp = service.changes().list(
+                    pageToken=pt,
+                    spaces="drive",
+                    fields=fields,
+                    pageSize=100,
+                    includeItemsFromAllDrives=True,
+                    supportsAllDrives=True
+                ).execute()
+
+                for ch in resp.get("changes", []):
+                    fid = ch.get("fileId")
+                    file = ch.get("file") or {}
+                    removed = ch.get("removed") or file.get("trashed")
+                    # If removed/trashed → delete KB entries
+                    if removed:
+                        delete_kb_for_file(fid)
+                        continue
+                    # Process only files in our folder
+                    parents = file.get("parents") or []
+                    if GDRIVE_FOLDER_ID not in parents:
+                        # Not in our watched folder → ignore (but optional cleanup if previously indexed)
+                        continue
+                    # Upsert the changed file
+                    try:
+                        text = download_drive_file_text(service, fid, file.get("mimeType"))
+                        upsert_kb_for_file(file, text)
+                    except Exception:
+                        logger.exception(f"Drive watcher: upsert failed for {fid}")
+
+                new_token = resp.get("newStartPageToken")
+                next_token = resp.get("nextPageToken")
+                if next_token:
+                    pt = next_token
+                else:
+                    if new_token:
+                        page_token = new_token
+                        _settings_set(token_key, page_token)
+                    break
+        except Exception:
+            logger.exception("Drive watcher: error while polling changes")
+        # Poll interval
+        time.sleep(20)
+
+# -------------------------
 # Main
 # -------------------------
 
 if __name__ == "__main__":
-    # In dev, set threaded=True so HF downloads don’t block other requests
-    # Enable auto-reload for live editing when FLASK_DEBUG is true (default)
     app.logger.info(f"Starting server on 0.0.0.0:{PORT} debug={FLASK_DEBUG}")
+    # Start Drive real-time watcher (changes API)
+    threading.Thread(target=watch_drive_changes_loop, daemon=True).start()
+
     app.run(host="0.0.0.0", port=PORT, threaded=True, debug=FLASK_DEBUG, use_reloader=FLASK_DEBUG)
