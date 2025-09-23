@@ -34,7 +34,7 @@ OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MONGO_URI     = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME       = os.getenv("MONGODB_DB", "emoai")
 LOG_FILE       = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "logs.log"))
-PORT           = int(os.getenv("PORT", "5000"))
+PORT           = int(os.getenv("PORT", "5001"))
 FLASK_DEBUG    = os.getenv("FLASK_DEBUG", "1").strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 
@@ -934,12 +934,12 @@ def get_drive_start_page_token(service):
 def watch_drive_changes_loop():
     """Background loop: poll Drive Changes API and keep KB in sync in near real time."""
     if not GDRIVE_FOLDER_ID:
-        logger.warning("Drive watcher disabled: GDRIVE_FOLDER_ID not set")
+        app.logger.warning("Drive watcher disabled: GDRIVE_FOLDER_ID not set")
         return
     try:
         service = build_drive_service()
     except Exception:
-        logger.exception("Drive watcher: failed to build service")
+        app.logger.exception("Drive watcher: failed to build service")
         return
 
     token_key = "drive_changes_start_page_token"
@@ -948,9 +948,9 @@ def watch_drive_changes_loop():
         try:
             page_token = get_drive_start_page_token(service)
             _settings_set(token_key, page_token)
-            logger.info(f"Drive watcher: initialized start page token {page_token}")
+            app.logger.info(f"Drive watcher: initialized start page token {page_token}")
         except Exception:
-            logger.exception("Drive watcher: failed to get start page token")
+            app.logger.exception("Drive watcher: failed to get start page token")
             return
 
     fields = "newStartPageToken,nextPageToken,changes(fileId,removed,file(id,name,mimeType,parents,modifiedTime,md5Checksum,trashed))"
@@ -985,7 +985,7 @@ def watch_drive_changes_loop():
                         text = download_drive_file_text(service, fid, file.get("mimeType"))
                         upsert_kb_for_file(file, text)
                     except Exception:
-                        logger.exception(f"Drive watcher: upsert failed for {fid}")
+                        app.logger.exception(f"Drive watcher: upsert failed for {fid}")
 
                 new_token = resp.get("newStartPageToken")
                 next_token = resp.get("nextPageToken")
@@ -995,9 +995,10 @@ def watch_drive_changes_loop():
                     if new_token:
                         page_token = new_token
                         _settings_set(token_key, page_token)
+                        app.logger.info(f"Drive watcher: updated page token to {page_token}")
                     break
         except Exception:
-            logger.exception("Drive watcher: error while polling changes")
+            app.logger.exception("Drive watcher: error while polling changes")
         # Poll interval
         time.sleep(20)
 
