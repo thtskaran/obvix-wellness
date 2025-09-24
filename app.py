@@ -6,11 +6,9 @@ from bson import ObjectId
 from transformers import pipeline
 from dotenv import load_dotenv
 
-
 import logging
 from logging.handlers import RotatingFileHandler
 from werkzeug.exceptions import HTTPException
-
 
 from io import BytesIO
 import tempfile
@@ -24,18 +22,18 @@ from googleapiclient.errors import HttpError
 from docx import Document
 from pypdf import PdfReader
 
-
 load_dotenv()
 
-
+# -------------------------
+# Config / Env
+# -------------------------
 GEMINI_KEY    = os.getenv("GEMINI_KEY")
 OLLAMA_URL    = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 MONGO_URI     = os.getenv("MONGODB_URI", "mongodb://localhost:27017")
 DB_NAME       = os.getenv("MONGODB_DB", "emoai")
-LOG_FILE       = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "logs.log"))
-PORT           = int(os.getenv("PORT", "5001"))
-FLASK_DEBUG    = os.getenv("FLASK_DEBUG", "1").strip().lower() in ("1", "true", "t", "yes", "y", "on")
-
+LOG_FILE      = os.getenv("LOG_FILE", os.path.join(os.path.dirname(__file__), "logs.log"))
+PORT          = int(os.getenv("PORT", "5001"))
+FLASK_DEBUG   = os.getenv("FLASK_DEBUG", "1").strip().lower() in ("1", "true", "t", "yes", "y", "on")
 
 GDRIVE_FOLDER_ID        = os.getenv("GDRIVE_FOLDER_ID")
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH", os.path.join(os.path.dirname(__file__), "client.json"))
@@ -43,41 +41,51 @@ KB_OVERLAP              = int(os.getenv("KB_OVERLAP") or "0")
 KB_TOPK                 = int(os.getenv("KB_TOPK", "2"))
 CHUNK_SIZE              = 1500  # fixed chunk size per request
 
-
-EMBED_MODEL   = "gemini-embedding-001"      # Gemini embeddings for RAG
-ROUTER_MODEL  = "gemini-1.5-flash"        # Router that emits JSON analysis
-CHAT_MODEL    = "gemma3:12b"             # Local Ollama model for the actual companion chat
-
+EMBED_MODEL   = "gemini-embedding-001"
+ROUTER_MODEL  = "gemini-2.5-flash"
+CHAT_MODEL    = "gemma3:12b"
 
 app = Flask(__name__)
-# Optional module logger for non-request helpers
 logger = logging.getLogger(__name__)
 
-
-
-
+# -------------------------
+# Logging setup
+# -------------------------
 def setup_logging(flask_app: Flask):
     os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True) if os.path.dirname(LOG_FILE) else None
     handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3)
-    formatter = logging.Formatter(
-        "%(asctime)s %(levelname)s %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     handler.setFormatter(formatter)
     handler.setLevel(logging.INFO)
 
-    # Attach to Flask app logger
     flask_app.logger.setLevel(logging.INFO)
     flask_app.logger.addHandler(handler)
 
-    # Also attach to Werkzeug to capture access logs
     werk = logging.getLogger("werkzeug")
     werk.setLevel(logging.INFO)
     werk.addHandler(handler)
 
 setup_logging(app)
 
-# Optional per-request logging
+# Add a simple dedicated logger for /chat traces to test.txt
+chat_logger = logging.getLogger("chat_trace")
+if not chat_logger.handlers:
+    chat_logger.setLevel(logging.INFO)
+    _test_log_path = os.path.join(os.path.dirname(__file__), "test.txt")
+    try:
+        fh = logging.FileHandler(_test_log_path)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        chat_logger.addHandler(fh)
+    except Exception:
+        app.logger.exception("Failed to initialize chat_trace logger")
+
+def chat_trace(uid, event, meta=None):
+    try:
+        rec = {"uid": uid, "event": event, "meta": meta or {}}
+        chat_logger.info(json.dumps(rec, ensure_ascii=False))
+    except Exception:
+        pass
+
 @app.before_request
 def _log_request():
     try:
@@ -91,7 +99,6 @@ def _log_response(resp):
     app.logger.info(f"<<< {resp.status_code} {request.method} {request.path}")
     return resp
 
-# Error logging while preserving HTTPException behavior
 @app.errorhandler(Exception)
 def _handle_exception(e):
     if isinstance(e, HTTPException):
@@ -100,17 +107,20 @@ def _handle_exception(e):
     app.logger.exception("Unhandled exception during request")
     return jsonify({"error": "internal_error"}), 500
 
+# -------------------------
+# DB / Collections
+# -------------------------
 mc = MongoClient(MONGO_URI)
 db = mc[DB_NAME]
-
 col_semantic  = db.semantic_memory   # user facts (name, prefs, relations, work)
 col_episodic  = db.episodic_memory   # high-level event summaries
-# Knowledge base (global corpus)
 col_kb_src    = db.kb_sources        # records per Drive file
 col_kb        = db.kb_chunks         # chunked embeddings
-col_settings = db.settings           # generic settings (e.g., Drive changes page token)
+col_settings  = db.settings          # generic settings (e.g., Drive changes page token)
 
-
+# -------------------------
+# Classifiers (best-effort)
+# -------------------------
 try:
     sent_clf = pipeline("text-classification", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
 except Exception:
@@ -127,29 +137,21 @@ except Exception:
     sarc_clf = None
 
 # -------------------------
-# Ephemeral per-user state (in-memory)
+# Ephemeral in-memory state
 # -------------------------
-
 USER = {}  # user_id -> {"conversation": [...]}
 
 # -------------------------
-# Utils
+# Embeddings / Similarity
 # -------------------------
-
 def get_embedding(text: str):
-    """Embed text using Gemini embeddings for RAG retrieval."""
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_KEY required")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{EMBED_MODEL}:embedContent?key={GEMINI_KEY}"
-    payload = {
-        "content": {
-            "parts": [{"text": text}]
-        }
-    }
+    payload = {"content": {"parts": [{"text": text}]}}
     resp = requests.post(url, json=payload, timeout=45)
     resp.raise_for_status()
     data = resp.json()
-    # Gemini returns: {"embedding": {"values": [float,...]}}
     emb = ((data or {}).get("embedding") or {}).get("values")
     if not emb:
         raise RuntimeError("embedding_failed")
@@ -161,12 +163,10 @@ def cosine(a, b):
     nb = math.sqrt(sum(y*y for y in b))
     return dot / (na*nb) if na and nb else 0.0
 
+# -------------------------
+# Memories Retrieval (RAG light)
+# -------------------------
 def retrieve_memories(user_id: str, query_text: str, k=3):
-    """
-    Simple RAG: vector-sim episodic memories + a few semantic facts.
-    Keeps context lightweight for the companion model.
-    """
-    # Vector similarity on episodic
     qemb = None
     episodic = list(col_episodic.find({"user_id": user_id}))
     if episodic:
@@ -188,7 +188,6 @@ def retrieve_memories(user_id: str, query_text: str, k=3):
         emostr = f" (felt {emo[0]})" if emo else ""
         ev_summaries.append(f"Previously: {ev.get('summary','')}{emostr}.")
 
-    # Semantic facts (lightweight)
     facts = []
     for f in col_semantic.find({"user_id": user_id}).limit(10):
         if f["type"] == "name":
@@ -203,7 +202,6 @@ def retrieve_memories(user_id: str, query_text: str, k=3):
     return facts + ev_summaries
 
 def get_first_name(user_id: str):
-    """Friendly personalization if we’ve saved a name."""
     doc = col_semantic.find_one({"user_id": user_id, "type": "name"})
     if not doc:
         return None
@@ -211,39 +209,194 @@ def get_first_name(user_id: str):
     return val.split()[0] if val else None
 
 # -------------------------
-# KB retrieval (neutral, non-therapeutic)
+# Aasha System Prompt
 # -------------------------
+AASHA_SYS = (
+    "You are Aasha — a warm, grounded, everyday chat companion. "
+    "Talk naturally with the user like a supportive friend. Keep replies concise and human. "
+    "You will receive structured context.\n\n"
+    "INPUTS YOU MAY RECEIVE:\n"
+    "- chat_history: the last 5 turns as a JSON list of {user, assistant} pairs (most-recent last).\n"
+    "- semantic_memories: brief user facts (name, preferences, relations, work roles).\n"
+    "- episodic_memories: short summaries of notable past events and feelings.\n"
+    "- emotion_signals: {sentiment, primary_emotion, sarcasm} gathered for the current user message.\n"
+    "- emotional_velocity: a scalar ~[0..2] showing recent intensity/volatility (higher = faster shifts).\n"
+    "- kb_snippets: short, relevant knowledge snippets retrieved from the user's Google Drive corpus.\n\n"
+    "BEHAVIOR:\n"
+    "- Be friendly, succinct, and real; avoid clinical tone.\n"
+    "- Use memories and recent history only when they clearly improve continuity or clarity.\n"
+    "- If emotional_velocity is high, keep a steady, calm tone; if low, keep it light and flowing.\n"
+    "- Ask at most one brief clarifying question only if needed.\n"
+    "- No meta-chatter; do not prefix with 'Aasha:' or similar.\n\n"
+    "OUTPUT:\n"
+    "Return STRICT JSON only: {\"message\":\"...\"} — one short conversational reply. "
+    "No markdown, no extra keys, no code fences."
+)
 
-def retrieve_kb(query_text: str, k=2):
+# -------------------------
+# Emotional Velocity helpers
+# -------------------------
+_EMOTION_AROUSAL = {
+    "joy": 0.40, "happy": 0.40, "love": 0.45,
+    "surprise": 0.65, "anticipation": 0.50,
+    "neutral": 0.10, "calm": 0.10,
+    "trust": 0.30, "contentment": 0.25,
+    "fear": 0.85, "anger": 0.90, "disgust": 0.80, "sadness": 0.70
+}
+
+def _sentiment_to_unit(label: str, score: float) -> float:
+    l = (label or "").lower()
+    s = max(0.0, min(1.0, float(score or 0.0)))
+    if "pos" in l: return s
+    if "neg" in l: return -s
+    return 0.0
+
+def _emotion_arousal(label: str, score: float) -> float:
+    base = _EMOTION_AROUSAL.get((label or "").lower(), 0.25)
+    return base * max(0.0, min(1.0, float(score or 0.0)))
+
+def compute_emotional_velocity(user_id: str, current_text: str, lookback: int = 6) -> dict:
+    state = USER.get(user_id, {"conversation": []})
+    recent_user_msgs = [t["text"] for t in state.get("conversation", []) if t["role"] == "user"][-lookback:]
+    series = recent_user_msgs + [current_text]
+
+    sent_label, sent_score = "neutral", 0.0
+    if sent_clf:
+        try:
+            s = sent_clf(current_text)[0]
+            sent_label, sent_score = s["label"], float(s.get("score", 0.0))
+        except Exception:
+            pass
+
+    emo_label, emo_score = "neutral", 0.0
+    if emo_clf:
+        try:
+            e_all = emo_clf(current_text)[0]
+            top = max(e_all, key=lambda x: x["score"])
+            emo_label, emo_score = top["label"], float(top["score"])
+        except Exception:
+            pass
+
+    sarcasm_flag = False
+    if sarc_clf:
+        try:
+            s = sarc_clf(current_text)[0]
+            sarcasm_flag = "sarcas" in (s["label"] or "").lower()
+        except Exception:
+            pass
+
+    stream = []
+    if sent_clf:
+        for m in series:
+            try:
+                r = sent_clf(m)[0]
+                stream.append(_sentiment_to_unit(r["label"], r.get("score", 0.0)))
+            except Exception:
+                stream.append(0.0)
+    else:
+        stream = [0.0] * len(series)
+
+    alpha = 0.6
+    ema = 0.0
+    for i in range(1, len(stream)):
+        delta = abs(stream[i] - stream[i - 1])
+        ema = alpha * delta + (1 - alpha) * ema
+
+    arousal = _emotion_arousal(emo_label, emo_score)
+    sarcasm_bump = 0.15 if sarcasm_flag else 0.0
+    velocity = min(2.0, max(0.0, ema + arousal + sarcasm_bump))
+
+    return {
+        "velocity": float(round(velocity, 4)),
+        "signals": {
+            "sentiment": {"label": sent_label, "score": sent_score},
+            "primary_emotion": {"label": emo_label, "score": emo_score},
+            "sarcasm": sarcasm_flag
+        }
+    }
+
+# -------------------------
+# KB Retrieval (hybrid semantic + contextual)
+# -------------------------
+def _tokenize_simple(text: str):
+    return [t for t in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(t) > 2]
+
+def _bm25lite_score(query_tokens, doc_tokens, k1=1.2, b=0.75, avgdl=400.0):
+    if not doc_tokens or not query_tokens:
+        return 0.0
+    tf = sum(doc_tokens.count(q) for q in set(query_tokens))
+    dl = max(1.0, float(len(doc_tokens)))
+    denom = tf + k1 * (1 - b + b * (dl / avgdl))
+    return (tf * (k1 + 1)) / denom if denom > 0 else 0.0
+
+def detect_guideline_topics(text: str):
     """
-    Retrieve up to k KB snippets by cosine similarity using stored embeddings.
-    Returns a list of small strings. Best-effort; safe to return [].
+    Lightweight detector for therapy guideline pulls.
+    Returns topic tags to bias retrieval (e.g., ['cbt', 'dbt']).
     """
+    t = (text or "").lower()
+    tags = []
+    # lexical hints
+    if any(w in t for w in ["cognitive distortion", "automatic thoughts", "thought record", "reframing", "cbt"]):
+        tags.append("cbt")
+    if any(w in t for w in ["distress tolerance", "wise mind", "opposite action", "radical acceptance", "dbt", "emotion regulation", "interpersonal effectiveness"]):
+        tags.append("dbt")
+    # emotion-based heuristic: high anger/fear + help-ish language → cbt/dbt
+    # (kept minimal; model-independent)
+    return list(sorted(set(tags)))
+
+def retrieve_kb(query_text: str, k=KB_TOPK, topic_tags=None):
+    """
+    Hybrid retrieval over KB (Mongo col_kb):
+      1) Cosine with Gemini embeddings (semantic)
+      2) BM25-lite keyword score (contextual)
+      3) Title/tag boosts (+ extra boost for requested topics like ['cbt','dbt'])
+      4) Hybrid rerank
+    Returns top-k short snippets.
+    """
+    topic_tags = topic_tags or []
     try:
         qemb = get_embedding(query_text)
     except Exception:
-        return []
+        qemb = None
 
-    # Only consider chunks that actually have embeddings
-    cur = col_kb.find({"embedding": {"$ne": None}}, {"text": 1, "embedding": 1}).limit(2000)
-    ranked = []
+    qtok = _tokenize_simple(query_text)
+    cur = col_kb.find({"embedding": {"$ne": None}}, {"text": 1, "embedding": 1, "title": 1, "tags": 1}).limit(3000)
+
+    scored = []
     for doc in cur:
+        text = doc.get("text", "")[:800]
         emb = doc.get("embedding")
-        if not emb:
-            continue
-        try:
-            score = cosine(qemb, emb)
-        except Exception:
-            score = 0.0
-        ranked.append((score, doc.get("text", "")[:400]))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    return [t for _, t in ranked[:k]]
+        title = (doc.get("title") or "")
+        tags = [str(t).lower() for t in (doc.get("tags") or [])]
 
+        cos = cosine(qemb, emb) if qemb and emb else 0.0
+        dtok = _tokenize_simple(text)
+        bm = _bm25lite_score(qtok, dtok)
+
+        # Base title/tag match
+        tmatch = 0.15 if any(t in (title.lower()) for t in qtok) else 0.0
+        if tags and any(q in tags for q in qtok):
+            tmatch += 0.10
+
+        # Topic bias for guideline pulls (CBT/DBT/etc.)
+        topic_boost = 0.0
+        if topic_tags:
+            # if any requested topic present in title or tags, boost
+            if any(tp in title.lower() for tp in topic_tags):
+                topic_boost += 0.20
+            if any(tp in tags for tp in topic_tags):
+                topic_boost += 0.20
+
+        hybrid = 0.72 * cos + 0.25 * bm + tmatch + topic_boost
+        scored.append((hybrid, text))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scored[:k]]
 
 # -------------------------
-# Router LLM (analysis JSON)
+# Router LLM (analysis JSON) — unchanged
 # -------------------------
-
 ROUTER_SYS = (
     "You are an analysis router for a friendly, grounded chat companion. "
     "Return STRICT JSON ONLY with keys: "
@@ -257,12 +410,6 @@ ROUTER_SYS = (
 )
 
 def call_router(user_id: str, user_message: str):
-    """
-    Calls the Gemini router model to emit a canonical analysis JSON:
-    - crisis flag/type
-    - memories (semantic/episodic)
-    - graph edges
-    """
     if not GEMINI_KEY:
         raise RuntimeError("GEMINI_KEY required")
 
@@ -287,21 +434,14 @@ def call_router(user_id: str, user_message: str):
         except Exception:
             pass
 
-    # Gemini generateContent with systemInstruction and JSON-only output
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{ROUTER_MODEL}:generateContent?key={GEMINI_KEY}"
     body = {
-        "systemInstruction": {
-            "parts": [{"text": ROUTER_SYS}]
-        },
+        "systemInstruction": { "parts": [{"text": ROUTER_SYS}] },
         "contents": [
             {
                 "role": "user",
                 "parts": [{
-                    "text": json.dumps({
-                        "user_id": user_id,
-                        "message": user_message,
-                        "signals": sig
-                    }, ensure_ascii=False)
+                    "text": json.dumps({"user_id": user_id, "message": user_message, "signals": sig}, ensure_ascii=False)
                 }]
             }
         ],
@@ -310,6 +450,15 @@ def call_router(user_id: str, user_message: str):
             "temperature": 0.2
         }
     }
+
+    try:
+        chat_trace(user_id, "router_prompt", {
+            "system": ROUTER_SYS,
+            "payload": {"contents": body.get("contents"), "generationConfig": body.get("generationConfig")}
+        })
+    except Exception:
+        pass
+
     r = requests.post(url, json=body, timeout=45)
     r.raise_for_status()
     data = r.json()
@@ -317,12 +466,17 @@ def call_router(user_id: str, user_message: str):
         txt = data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
         raise RuntimeError(f"router_parse_failed: {data}") from e
+
+    try:
+        chat_trace(user_id, "router_response_preview", {"chars": len(txt) if isinstance(txt, str) else None, "preview": txt[:500] if isinstance(txt, str) else None})
+    except Exception:
+        pass
+
     return json.loads(txt)
 
 # -------------------------
-# Crisis replies (warm, non-clinical, no exercises)
+# Crisis short replies
 # -------------------------
-
 def crisis_reply(kind: str):
     if kind == "suicidality":
         return ("I'm really sorry you're feeling this much pain. You deserve support right now. "
@@ -341,54 +495,63 @@ def crisis_reply(kind: str):
     return ("I'm here with you. You're not alone, and it's okay to ask for help close to you right now.")
 
 # -------------------------
+# Build Aasha prompt (history+memories+EV+KB)
+# -------------------------
+def build_companion_prompt(user_id, user_message, kb_snippets):
+    # last 5 turns (pairs)
+    conv = USER.get(user_id, {}).get("conversation", [])
+    pairs = []
+    i = 0
+    while i < len(conv) - 1:
+        if conv[i]["role"] == "user" and conv[i + 1]["role"] == "assistant":
+            pairs.append({"user": conv[i]["text"], "assistant": conv[i + 1]["text"]})
+            i += 2
+        else:
+            i += 1
+    history_pairs = pairs[-5:]
 
-def build_companion_prompt(user_id, user_message, memories_for_prompt, convo_tail):
-    """
-    Build a prompt that asks the Ollama chat model to return exactly one short chat message as JSON.
-    Tone: friendly, grounded, non-clinical. No unsolicited techniques or advice.
-    """
-    persona = (
-        "You are Emo AI — a grounded, everyday chat companion (not a clinician). "
-        "Sound like a caring friend. Keep it short and natural. "
-        "Do NOT suggest techniques, exercises, or action steps unless the user explicitly asks. "
-        "Stay on the user's topic; be concise and real."
-    )
+    # semantic facts (compact)
+    semantic_facts = []
+    for f in col_semantic.find({"user_id": user_id}).limit(12):
+        if f["type"] == "name":
+            semantic_facts.append({"type": "name", "value": f.get("value")})
+        elif f["type"] == "preference":
+            semantic_facts.append({"type": "preference", "value": f.get("value")})
+        elif f["type"] == "relation":
+            semantic_facts.append({"type": "relation", "relation": f.get("relation"), "name": f.get("name")})
+        elif f["type"] == "profession":
+            semantic_facts.append({"type": "profession", "value": f.get("value")})
 
-    ctx = []
-    for line in memories_for_prompt[:4]: # Increased memory context slightly
-        ctx.append(line)
+    # episodic (recent)
+    episodic_docs = list(col_episodic.find({"user_id": user_id}).sort("time", -1).limit(8))
+    episodic_summaries = [{"summary": d.get("summary", "")} for d in episodic_docs[:3]]
 
-    first_name = get_first_name(user_id)
-    name_line = f"FirstName={first_name}." if first_name else "FirstName=null."
+    # emotional velocity for current msg
+    ev = compute_emotional_velocity(user_id, user_message)
 
-    style_rules = (
-        "OUTPUT FORMAT: Return STRICT JSON exactly in this shape (and nothing else): "
-        "{\"message\": \"...\"}. "
-        "A single short string in 'message'. "
-        "No other keys. No markdown/code fences. No prefixes like 'EmoAI:'. "
-        "STYLE: Warm, succinct, human. "
-        "Ask at most one brief clarifying question only if it's necessary to respond helpfully. "
-        "Do NOT propose coping strategies, breathing, grounding, journaling, routines, or any how-to advice unless the user asked."
-    )
-
-    tail = ""
-    if convo_tail:
-        for pair in convo_tail[-2:]:
-            tail += f"User: {pair['u']}\nEmoAI: {pair['a']}\n"
+    instruction = {
+        "system": AASHA_SYS,
+        "chat_history": history_pairs,
+        "semantic_memories": semantic_facts[:10],
+        "episodic_memories": episodic_summaries,
+        "emotion_signals": ev["signals"],
+        "emotional_velocity": ev["velocity"],
+        "kb_snippets": kb_snippets,
+        "user_input": user_message
+    }
 
     prompt = (
-        f"{persona}\n\n"
-        f"{style_rules}\n\n"
-        f"Context:\n- {name_line}\n- " + "\n- ".join(ctx) + "\n\n"
-        + (f"Recent:\n{tail}\n" if tail else "")
-        + "Now craft one chat message as per OUTPUT FORMAT and STYLE.\n\n"
-        f"User: {user_message}\n"
-        "EmoAI -> JSON only:"
+        f"{AASHA_SYS}\n\n"
+        "CONTEXT (JSON):\n"
+        + json.dumps(instruction, ensure_ascii=False)
+        + "\n\nAasha -> Return STRICT JSON only as {\"message\":\"...\"}:"
     )
     return prompt
 
+# -------------------------
+# Ollama call + extract
+# -------------------------
 def ollama_generate(prompt: str):
-    """Query local Ollama and return raw text (ideally JSON per our prompt)."""
     url = f"{OLLAMA_URL}/api/generate"
     payload = {"model": CHAT_MODEL, "prompt": prompt, "stream": False}
     r = requests.post(url, json=payload, timeout=60)
@@ -397,7 +560,6 @@ def ollama_generate(prompt: str):
         j = r.json()
         return (j.get("response") or j.get("text") or "").strip()
     except json.JSONDecodeError:
-        # Fallback for NDJSON/stream-like responses
         last = ""
         for line in r.text.splitlines():
             line = line.strip()
@@ -410,88 +572,59 @@ def ollama_generate(prompt: str):
                 continue
         return (last or r.text).strip()
 
-# Single-message extractor: normalize model output to one concise string
 def extract_message(raw: str) -> str:
     texts = []
-
     def add_text(t):
-        if not isinstance(t, str):
-            return
+        if not isinstance(t, str): return
         s = t.strip()
-        s = re.sub(r"^(EmoAI|AI|Assistant)\s*:\s*", "", s, flags=re.I)
-        if s:
-            texts.append(s)
-
+        s = re.sub(r"^(EmoAI|AI|Assistant|Aasha)\s*:\s*", "", s, flags=re.I)
+        if s: texts.append(s)
     def coerce(obj):
         if isinstance(obj, dict):
             if isinstance(obj.get("message"), str):
                 add_text(obj["message"])
             elif isinstance(obj.get("messages"), list):
                 for it in obj["messages"]:
-                    if isinstance(it, str):
-                        add_text(it)
-                    elif isinstance(it, dict):
-                        add_text(it.get("text") or it.get("content") or it.get("message") or "")
+                    if isinstance(it, str): add_text(it)
+                    elif isinstance(it, dict): add_text(it.get("text") or it.get("content") or it.get("message") or "")
             else:
                 add_text(obj.get("text") or obj.get("content"))
         elif isinstance(obj, list):
             for it in obj:
-                if isinstance(it, str):
-                    add_text(it)
-                elif isinstance(it, dict):
-                    add_text(it.get("text") or it.get("content") or it.get("message") or "")
-
-    # 1) Try direct JSON
+                if isinstance(it, str): add_text(it)
+                elif isinstance(it, dict): add_text(it.get("text") or it.get("content") or it.get("message") or "")
     try:
-        obj = json.loads(raw)
-        coerce(obj)
+        obj = json.loads(raw); coerce(obj)
     except Exception:
         pass
-
-    # 2) Try fenced code blocks ```json ... ```
     if not texts:
         blocks = re.findall(r"```(?:json|JSON)?\s*(.*?)\s*```", raw, flags=re.S)
         for blk in blocks:
             try:
-                obj = json.loads(blk.strip())
-                coerce(obj)
+                obj = json.loads(blk.strip()); coerce(obj)
             except Exception:
                 continue
-
-    # 3) Try inline JSON chunks
     if not texts:
         for m in re.finditer(r"(\{.*?\}|\[.*?\])", raw, flags=re.S):
             chunk = m.group(1).strip()
             if 2 < len(chunk) < 8000:
                 try:
-                    obj = json.loads(chunk)
-                    coerce(obj)
+                    obj = json.loads(chunk); coerce(obj)
                 except Exception:
                     continue
-
-    # 4) Fallbacks
     if not texts:
-        # pick first paragraph-like chunk
         chunks = [s.strip() for s in re.split(r"\n\s*\n", raw) if s.strip()]
-        if chunks:
-            add_text(chunks[0])
-        else:
-            add_text(raw.strip())
-
-    # Finalize
+        if chunks: add_text(chunks[0])
+        else: add_text(raw.strip())
     if not texts:
         return "I'm here with you. What's on your mind?"
-
-    # Prefer the first concise line
     first = texts[0].strip()
-    # Collapse internal whitespace
     first = re.sub(r"\s+\n\s+|\s{2,}", " ", first).strip()
     return first
 
 # -------------------------
 # HTTP: /chat
 # -------------------------
-
 @app.route("/chat", methods=["POST"])
 def chat():
     data = request.get_json(force=True) or {}
@@ -499,14 +632,12 @@ def chat():
     uid_raw = data.get("user_id")
     user_id = (str(uid_raw).strip() if uid_raw is not None else "")
 
-    # Be flexible with the message key
     msg_raw = None
     for k in ("chat", "message", "text", "input", "content"):
         if k in data:
             msg_raw = data.get(k)
             break
 
-    # Normalize nested payloads
     if isinstance(msg_raw, (dict, list)):
         if isinstance(msg_raw, dict) and "text" in msg_raw:
             msg_raw = msg_raw["text"]
@@ -517,113 +648,141 @@ def chat():
 
     if not user_id or not user_msg:
         app.logger.warning("400 bad request: missing user_id or message")
+        chat_trace(str(uid_raw) if uid_raw is not None else "", "bad_request", {
+            "reason": "missing user_id or message",
+            "keys": list(data.keys())
+        })
         return jsonify({
             "error": "user_id and non-empty message required",
             "hint": "Provide user_id and one of chat|message|text|input|content"
         }), 400
 
     app.logger.info(f"/chat start uid={user_id}")
+    chat_trace(user_id, "request_received", {"keys": list(data.keys()), "msg_len": len(user_msg)})
 
     state = USER.setdefault(user_id, {"conversation": []})
 
     # 1) Router LLM → analysis JSON
+    chat_trace(user_id, "router_call_start", {"model": ROUTER_MODEL})
     try:
         analysis = call_router(user_id, user_msg)
         app.logger.info(f"router_ok uid={user_id}")
+        chat_trace(user_id, "router_call_ok", {
+            "crisis": analysis.get("crisis"),
+            "semantic_count": len(analysis.get("memories", {}).get("semantic", [])),
+            "episodic_count": len(analysis.get("memories", {}).get("episodic", []))
+        })
     except Exception as e:
+        chat_trace(user_id, "router_call_failed", {"error": str(e)})
         app.logger.exception("router_llm_failed")
         return jsonify({"error": "router_llm_failed", "details": str(e)}), 500
 
-    # 2) Persist memories
-    # Semantic (upsert light facts)
+    # 2) Persist memories from analysis
+    sem_upserts = 0
     for s in analysis.get("memories", {}).get("semantic", []):
         doc = {"user_id": user_id, "type": s["type"], "value": s.get("value")}
         if s["type"] == "relation":
             doc["relation"] = s.get("relation")
             doc["name"] = s.get("name")
-        # naive upsert by (user_id, type, relation, name)
         filt = {"user_id": user_id, "type": s["type"]}
         if "relation" in doc: filt["relation"] = doc["relation"]
         if "name" in doc:     filt["name"] = doc["name"]
-        col_semantic.update_one(filt, {"$set": doc}, upsert=True)
+        res = col_semantic.update_one(filt, {"$set": doc}, upsert=True)
+        sem_upserts += 1
+        chat_trace(user_id, "semantic_upsert", {
+            "type": s["type"], "matched": res.matched_count,
+            "modified": res.modified_count,
+            "upserted_id": str(res.upserted_id) if getattr(res, "upserted_id", None) else None
+        })
+    if sem_upserts:
+        chat_trace(user_id, "semantic_summary", {"upserts": sem_upserts})
 
-    # Episodic (embed on write for RAG)
+    epi_inserts, embed_ok, embed_fail = 0, 0, 0
     for ev in analysis.get("memories", {}).get("episodic", []):
         summ = (ev.get("summary", "") or "")[:500]
-        edoc = {
-            "user_id": user_id,
-            "summary": summ,
-            "emotions": [],  # could be added by router if desired
-            "time": datetime.utcnow()
-        }
+        edoc = {"user_id": user_id, "summary": summ, "emotions": [], "time": datetime.utcnow()}
         try:
-            edoc["embedding"] = get_embedding(summ)
+            edoc["embedding"] = get_embedding(summ); embed_ok += 1
         except Exception:
-            pass
-        col_episodic.insert_one(edoc)
+            embed_fail += 1
+        res = col_episodic.insert_one(edoc)
+        epi_inserts += 1
+        chat_trace(user_id, "episodic_inserted", {"id": str(res.inserted_id), "has_emb": bool(edoc.get("embedding"))})
+    if epi_inserts or embed_fail:
+        chat_trace(user_id, "episodic_summary", {"inserts": epi_inserts, "embed_ok": embed_ok, "embed_fail": embed_fail})
 
     # 3) Crisis short-circuit
     cr = analysis.get("crisis", {"flag": False, "type": "none"})
     if cr.get("flag"):
         app.logger.warning(f"crisis_detected uid={user_id} type={cr.get('type')}")
+        chat_trace(user_id, "crisis_short_circuit", {"type": cr.get("type")})
         msg = crisis_reply(cr.get("type", "none"))
         message = extract_message(json.dumps({"message": msg}))
         state["conversation"].append({"role": "user", "text": user_msg})
         state["conversation"].append({"role": "assistant", "text": message})
-        return jsonify({
-            "message": message,
-            "meta": {
-                "crisis": cr
-            }
-        })
+        chat_trace(user_id, "response_sent", {"status": "crisis"})
+        return jsonify({"message": message, "meta": {"crisis": cr}})
 
-    # 4) Build grounded prompt & query Ollama
-    mem_lines = retrieve_memories(user_id, user_msg, k=3)
-
-    # Bring in a couple of relevant KB snippets (neutral KB)
+    # 4) KB + Memories + EV
     try:
-        kb_lines = retrieve_kb(user_msg, k=KB_TOPK)
+        facts_total = col_semantic.count_documents({"user_id": user_id})
+        epis_total = col_episodic.count_documents({"user_id": user_id})
     except Exception:
+        facts_total = epis_total = None
+
+    # topic detection for CBT/DBT pulls
+    guideline_topics = detect_guideline_topics(user_msg)
+
+    chat_trace(user_id, "kb_retrieval_start", {"topk": KB_TOPK, "topics": guideline_topics})
+    try:
+        kb_lines = retrieve_kb(user_msg, k=KB_TOPK, topic_tags=guideline_topics)
+        chat_trace(user_id, "kb_retrieval_done", {"returned": len(kb_lines)})
+    except Exception as e:
         kb_lines = []
-    mem_lines = (kb_lines[:KB_TOPK]) + mem_lines
+        chat_trace(user_id, "kb_retrieval_failed", {"error": str(e)})
 
-    # last 2 exchanges for continuity
-    tail = []
-    conv = state["conversation"]
-    for i in range(len(conv) - 1):
-        if conv[i]["role"] == "user" and conv[i + 1]["role"] == "assistant":
-            tail.append({"u": conv[i]["text"], "a": conv[i + 1]["text"]})
+    mem_lines = retrieve_memories(user_id, user_msg, k=3)
+    chat_trace(user_id, "memory_retrieval", {"facts_total": facts_total, "epis_total": epis_total, "returned": len(mem_lines)})
 
-    prompt = build_companion_prompt(user_id, user_msg, mem_lines, tail)
+    # Build Aasha prompt
+    prompt = build_companion_prompt(user_id, user_msg, kb_lines)
+    chat_trace(user_id, "prompt_built", {"chars": len(prompt)})
+    try:
+        chat_trace(user_id, "ollama_prompt", {"prompt": prompt})
+    except Exception:
+        pass
 
+    # 5) Generate
+    chat_trace(user_id, "ollama_call_start", {"model": CHAT_MODEL})
     try:
         raw = ollama_generate(prompt)
         app.logger.info(f"ollama_ok uid={user_id}")
+        chat_trace(user_id, "ollama_call_ok", {"raw_chars": len(raw)})
+        try:
+            chat_trace(user_id, "ollama_response_preview", {"chars": len(raw) if isinstance(raw, str) else None, "preview": raw[:500] if isinstance(raw, str) else None})
+        except Exception:
+            pass
     except Exception as e:
+        chat_trace(user_id, "ollama_call_failed", {"error": str(e)})
         app.logger.exception("ollama_failed")
         return jsonify({"error": "ollama_failed", "details": str(e)}), 500
 
-    # Normalize to a single message regardless of model quirks
     message = extract_message(raw)
+    chat_trace(user_id, "message_extracted", {"chars": len(message), "preview": message[:120]})
 
-    # 5) Log conversation
+    # 6) Log conversation
     state["conversation"].append({"role": "user", "text": user_msg})
     state["conversation"].append({"role": "assistant", "text": message})
+    chat_trace(user_id, "conversation_appended", {"total_turns": len(state["conversation"])})
 
     app.logger.info(f"/chat done uid={user_id}")
-    return jsonify({
-        "message": message,
-        "meta": {
-             "analysis": analysis # Optionally return the router analysis
-        }
-    })
+    chat_trace(user_id, "response_sent", {"status": "ok"})
+    return jsonify({"message": message, "meta": {"analysis": analysis}})
 
 # -------------------------
-# Knowledge Base: Google Drive sync and retrieval
+# Google Drive KB ingestion/sync
 # -------------------------
-
 def build_drive_service():
-    """Create a Drive API client using service account credentials."""
     if not GDRIVE_FOLDER_ID:
         raise RuntimeError("GDRIVE_FOLDER_ID not set")
     if not os.path.isfile(GOOGLE_CREDENTIALS_PATH):
@@ -633,11 +792,10 @@ def build_drive_service():
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 def list_drive_files(service, folder_id):
-    """List files in a Drive folder (no trashed)."""
     files = []
     page_token = None
     q = f"'{folder_id}' in parents and trashed=false"
-    fields = "nextPageToken, files(id,name,mimeType,modifiedTime,md5Checksum,size)"
+    fields = "nextPageToken, files(id,name,mimeType,modifiedTime,md5Checksum,size,parents)"
     while True:
         resp = service.files().list(q=q, fields=fields, pageToken=page_token).execute()
         files.extend(resp.get("files", []))
@@ -647,13 +805,10 @@ def list_drive_files(service, folder_id):
     return files
 
 def download_drive_file_text(service, file_id, mime_type):
-    """Download a Drive file and return UTF-8 text (no OCR)."""
-    # Google Docs → export as text/plain
     if mime_type == "application/vnd.google-apps.document":
         data = service.files().export(fileId=file_id, mimeType="text/plain").execute()
         return data.decode("utf-8", errors="ignore")
 
-    # Binary files → get_media
     req = service.files().get_media(fileId=file_id)
     buf = BytesIO()
     downloader = MediaIoBaseDownload(buf, req)
@@ -671,8 +826,7 @@ def download_drive_file_text(service, file_id, mime_type):
             txt = []
             for page in reader.pages:
                 t = page.extract_text() or ""
-                if t:
-                    txt.append(t)
+                if t: txt.append(t)
             return "\n".join(txt)
         except Exception:
             return ""
@@ -684,35 +838,29 @@ def download_drive_file_text(service, file_id, mime_type):
         except Exception:
             return ""
 
-    # Fallback attempt
     try:
         return data.decode("utf-8", errors="ignore")
     except Exception:
         return ""
 
 def chunk_text(text, max_chars=1800, overlap=200):
-    """Simple char-based chunking with overlap."""
     text = (text or "")
-    if not text:
-        return []
+    if not text: return []
     chunks, i, n = [], 0, len(text)
     while i < n:
         j = min(i + max_chars, n)
         chunks.append(text[i:j])
-        if j == n:
-            break
+        if j == n: break
         i = max(0, j - overlap)
     return chunks
 
 def title_tags(title: str):
-    """Derive light tags from title (e.g., words >=3 chars)."""
     t = (title or "").strip().lower()
     parts = re.split(r"[\s_\-\.\(\)\[\]:]+", t)
     parts = [p for p in parts if p]
     return list({p for p in parts if len(p) >= 3})
 
 def upsert_kb_for_file(file_meta, text):
-    """Upsert chunks for a single Drive file into Mongo KB."""
     fid = file_meta["id"]
     title = file_meta.get("name", "")
     mime  = file_meta.get("mimeType", "")
@@ -723,12 +871,16 @@ def upsert_kb_for_file(file_meta, text):
     if src and src.get("modifiedTime") == mtime and src.get("content_hash") == content_hash:
         return {"status": "skip", "file_id": fid, "title": title}
 
-    # Remove old chunks if any
     col_kb.delete_many({"source_id": fid})
 
-    # Chunk + embed
-    chunks = chunk_text(text, max_chars=CHUNK_SIZE, overlap=KB_OVERLAP)
+    # Derive tags from title + explicit CBT/DBT normalizations
     tags = title_tags(title)
+    lowered = title.lower()
+    if "cbt" in lowered or "cognitive" in lowered: tags += ["cbt"]
+    if "dbt" in lowered or "dialectical" in lowered: tags += ["dbt"]
+    tags = list(sorted(set(tags)))
+
+    chunks = chunk_text(text, max_chars=CHUNK_SIZE, overlap=KB_OVERLAP)
     now = datetime.utcnow()
     for idx, ch in enumerate(chunks):
         try:
@@ -764,32 +916,24 @@ def upsert_kb_for_file(file_meta, text):
     return {"status": "updated", "file_id": fid, "title": title, "chunks": len(chunks)}
 
 def delete_kb_for_file(file_id: str):
-    """Remove KB records for a removed/trashed file."""
     col_kb.delete_many({"source_id": file_id})
     col_kb_src.delete_one({"file_id": file_id})
 
 # -------------------------
 # Drive Changes watcher
 # -------------------------
-
 def _settings_get(key, default=None):
     doc = col_settings.find_one({"_id": key})
     return (doc or {}).get("val", default)
 
 def _settings_set(key, val):
-    col_settings.update_one(
-        {"_id": key},
-        {"$set": {"val": val, "time": datetime.utcnow()}},
-        upsert=True
-    )
+    col_settings.update_one({"_id": key}, {"$set": {"val": val, "time": datetime.utcnow()}}, upsert=True)
 
 def get_drive_start_page_token(service):
-    """Fetch current Drive start page token."""
     res = service.changes().getStartPageToken().execute()
     return res.get("startPageToken")
 
 def watch_drive_changes_loop():
-    """Background loop: poll Drive Changes API and keep KB in sync in near real time."""
     if not GDRIVE_FOLDER_ID:
         app.logger.warning("Drive watcher disabled: GDRIVE_FOLDER_ID not set")
         return
@@ -828,16 +972,12 @@ def watch_drive_changes_loop():
                     fid = ch.get("fileId")
                     file = ch.get("file") or {}
                     removed = ch.get("removed") or file.get("trashed")
-                    # If removed/trashed → delete KB entries
                     if removed:
                         delete_kb_for_file(fid)
                         continue
-                    # Process only files in our folder
                     parents = file.get("parents") or []
                     if GDRIVE_FOLDER_ID not in parents:
-                        # Not in our watched folder → ignore (but optional cleanup if previously indexed)
                         continue
-                    # Upsert the changed file
                     try:
                         text = download_drive_file_text(service, fid, file.get("mimeType"))
                         upsert_kb_for_file(file, text)
@@ -856,16 +996,12 @@ def watch_drive_changes_loop():
                     break
         except Exception:
             app.logger.exception("Drive watcher: error while polling changes")
-        # Poll interval
         time.sleep(20)
 
 # -------------------------
 # Main
 # -------------------------
-
 if __name__ == "__main__":
     app.logger.info(f"Starting server on 0.0.0.0:{PORT} debug={FLASK_DEBUG}")
-    # Start Drive real-time watcher (changes API)
     threading.Thread(target=watch_drive_changes_loop, daemon=True).start()
-
     app.run(host="0.0.0.0", port=PORT, threaded=True, debug=FLASK_DEBUG, use_reloader=FLASK_DEBUG)
