@@ -529,8 +529,8 @@ def build_companion_prompt(user_id, user_message, kb_snippets):
     # emotional velocity for current msg
     ev = compute_emotional_velocity(user_id, user_message)
 
+   
     instruction = {
-        "system": AASHA_SYS,
         "chat_history": history_pairs,
         "semantic_memories": semantic_facts[:10],
         "episodic_memories": episodic_summaries,
