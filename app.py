@@ -4,7 +4,6 @@ from flask import Flask, request, jsonify
 from pymongo import MongoClient
 from bson import ObjectId
 from transformers import pipeline
-from transitions import Machine
 from dotenv import load_dotenv
 
 
@@ -46,19 +45,8 @@ CHUNK_SIZE              = 1500  # fixed chunk size per request
 
 
 EMBED_MODEL   = "gemini-embedding-001"      # Gemini embeddings for RAG
-ROUTER_MODEL  = "gemini-2.5-flash"        # Router that emits JSON analysis
-CHAT_MODEL    = "emoai-sarah"             # Local Ollama model for the actual companion chat
-
-
-CONV_STATES = [
-    "casual_chat",
-    "light_support",
-    "deeper_exploration",
-    "skill_offering",
-    "crisis_support",
-    "cool_down",
-    "idle",
-]
+ROUTER_MODEL  = "gemini-1.5-flash"        # Router that emits JSON analysis
+CHAT_MODEL    = "gemma3:12b"             # Local Ollama model for the actual companion chat
 
 
 app = Flask(__name__)
@@ -117,7 +105,6 @@ db = mc[DB_NAME]
 
 col_semantic  = db.semantic_memory   # user facts (name, prefs, relations, work)
 col_episodic  = db.episodic_memory   # high-level event summaries
-col_diff      = db.diff_memory       # state changes over time (emotion/engagement)
 # Knowledge base (global corpus)
 col_kb_src    = db.kb_sources        # records per Drive file
 col_kb        = db.kb_chunks         # chunked embeddings
@@ -143,7 +130,7 @@ except Exception:
 # Ephemeral per-user state (in-memory)
 # -------------------------
 
-USER = {}  # user_id -> {"conversation": [...], "fsm": DuoFSM(), "conv": ConversationFSM()}
+USER = {}  # user_id -> {"conversation": [...]}
 
 # -------------------------
 # Utils
@@ -252,84 +239,6 @@ def retrieve_kb(query_text: str, k=2):
     ranked.sort(key=lambda x: x[0], reverse=True)
     return [t for _, t in ranked[:k]]
 
-# -------------------------
-# FSM (emotion + engagement)
-# -------------------------
-
-class DuoFSM:
-    """
-    FSM with two tracks:
-      - emotion_state: neutral|positive|negative
-      - engagement_state: engaged|withdrawn|looping|intimate
-    Transitions are applied from the router-LLM JSON, not hand-coded heuristics.
-    """
-    def __init__(self):
-        self.emotion_state = "neutral"
-        self.engagement_state = "engaged"
-
-        self.emotion_machine = Machine(
-            model=self,
-            states=["neutral", "positive", "negative"],
-            transitions=[
-                {"trigger": "set_emotion", "source": "*", "dest": "negative", "conditions": lambda: self._next == "negative"},
-                {"trigger": "set_emotion", "source": "*", "dest": "positive", "conditions": lambda: self._next == "positive"},
-                {"trigger": "set_emotion", "source": "*", "dest": "neutral",  "conditions": lambda: self._next == "neutral"},
-            ],
-            initial="neutral",
-            model_attribute="emotion_state",  # use model_attribute with transitions>=0.9
-        )
-
-        self.engagement_machine = Machine(
-            model=self,
-            states=["engaged", "withdrawn", "looping", "intimate"],
-            transitions=[
-                {"trigger": "set_eng", "source": "*", "dest": "withdrawn", "conditions": lambda: self._next_e == "withdrawn"},
-                {"trigger": "set_eng", "source": "*", "dest": "looping",   "conditions": lambda: self._next_e == "looping"},
-                {"trigger": "set_eng", "source": "*", "dest": "intimate",  "conditions": lambda: self._next_e == "intimate"},
-                {"trigger": "set_eng", "source": "*", "dest": "engaged",   "conditions": lambda: self._next_e == "engaged"},
-            ],
-            initial="engaged",
-            model_attribute="engagement_state",
-        )
-
-        self._next   = "neutral"
-        self._next_e = "engaged"
-
-    def apply(self, emo_next, eng_next):
-        self._next, self._next_e = emo_next, eng_next
-        self.set_emotion()
-        self.set_eng()
-
-# New: High-level conversation mode FSM
-class ConversationFSM:
-    """
-    High-level conversational mode controller.
-    States: casual_chat | light_support | deeper_exploration | skill_offering | crisis_support | cool_down | idle
-    Transitions are driven by router JSON (or overridden to crisis_support when crisis=true).
-    """
-    def __init__(self):
-        self.conversation_state = "casual_chat"
-        self._next_c = "casual_chat"
-
-        # Build transitions dynamically for readability
-        trans = [
-            {"trigger": "set_conv", "source": "*", "dest": s, "conditions": (lambda s=s: self._next_c == s)}
-            for s in CONV_STATES
-        ]
-
-        self.conv_machine = Machine(
-            model=self,
-            states=CONV_STATES,
-            transitions=trans,
-            initial="casual_chat",
-            model_attribute="conversation_state",
-        )
-
-    def apply(self, next_state: str):
-        self._next_c = next_state or "casual_chat"
-        if self._next_c not in CONV_STATES:
-            self._next_c = "casual_chat"
-        self.set_conv()
 
 # -------------------------
 # Router LLM (analysis JSON)
@@ -339,23 +248,19 @@ ROUTER_SYS = (
     "You are an analysis router for a friendly, grounded chat companion. "
     "Return STRICT JSON ONLY with keys: "
     "{ 'crisis': {'flag': bool, 'type': 'none|suicidality|psychosis|abuse|dysregulation'}, "
-    "'fsm': {'emotion':'neutral|positive|negative','engagement':'engaged|withdrawn|looping|intimate'}, "
-    "'conversation': {'state':'casual_chat|light_support|deeper_exploration|skill_offering|crisis_support|cool_down|idle', 'confidence': number}, "
     "'memories': {'semantic': [ { 'type':'name|preference|relation|profession', 'value': str, 'relation': str|null, 'name': str|null } ], "
-    "'episodic': [ { 'summary': str } ], 'diff': [ { 'kind':'emotion_state_change|engagement_state_change', 'from': str, 'to': str } ] }, "
+    "'episodic': [ { 'summary': str } ] }, "
     "'graph': { 'edges': [ ['node_a','node_b'] ] } } "
     "Rules: keep it minimal; summarize episodic at high level; include only key facts; "
     "set crisis true ONLY if the message indicates imminent risk; prefer 'none' otherwise; "
-    "IF crisis.flag is true, set conversation.state='crisis_support'; "
     "avoid romantic/parasocial attachments; avoid irreversible advice."
 )
 
-def call_router(user_id: str, user_message: str, last_states):
+def call_router(user_id: str, user_message: str):
     """
     Calls the Gemini router model to emit a canonical analysis JSON:
     - crisis flag/type
-    - FSM targets
-    - memories (semantic/episodic/diff)
+    - memories (semantic/episodic)
     - graph edges
     """
     if not GEMINI_KEY:
@@ -395,7 +300,6 @@ def call_router(user_id: str, user_message: str, last_states):
                     "text": json.dumps({
                         "user_id": user_id,
                         "message": user_message,
-                        "last_states": last_states,
                         "signals": sig
                     }, ensure_ascii=False)
                 }]
@@ -438,7 +342,7 @@ def crisis_reply(kind: str):
 
 # -------------------------
 
-def build_companion_prompt(user_id, user_message, analysis_json, memories_for_prompt, convo_tail):
+def build_companion_prompt(user_id, user_message, memories_for_prompt, convo_tail):
     """
     Build a prompt that asks the Ollama chat model to return exactly one short chat message as JSON.
     Tone: friendly, grounded, non-clinical. No unsolicited techniques or advice.
@@ -450,13 +354,8 @@ def build_companion_prompt(user_id, user_message, analysis_json, memories_for_pr
         "Stay on the user's topic; be concise and real."
     )
 
-    fsm = analysis_json.get("fsm", {})
-    conv = (analysis_json.get("conversation", {}) or {}).get("state", "casual_chat")
-    ctx = [
-        f"Emotion={fsm.get('emotion','neutral')}, Engagement={fsm.get('engagement','engaged')}.",
-        f"Mode={conv.upper()}."
-    ]
-    for line in memories_for_prompt[:2]:
+    ctx = []
+    for line in memories_for_prompt[:4]: # Increased memory context slightly
         ctx.append(line)
 
     first_name = get_first_name(user_id)
@@ -469,8 +368,7 @@ def build_companion_prompt(user_id, user_message, analysis_json, memories_for_pr
         "No other keys. No markdown/code fences. No prefixes like 'EmoAI:'. "
         "STYLE: Warm, succinct, human. "
         "Ask at most one brief clarifying question only if it's necessary to respond helpfully. "
-        "Do NOT propose coping strategies, breathing, grounding, journaling, routines, or any how-to advice unless the user asked. "
-        "If Mode=CRISIS_SUPPORT, be very brief and compassionate."
+        "Do NOT propose coping strategies, breathing, grounding, journaling, routines, or any how-to advice unless the user asked."
     )
 
     tail = ""
@@ -626,22 +524,17 @@ def chat():
 
     app.logger.info(f"/chat start uid={user_id}")
 
-    state = USER.setdefault(user_id, {"conversation": [], "fsm": DuoFSM(), "conv": ConversationFSM()})
-    last_states = {
-        "emotion": state["fsm"].emotion_state,
-        "engagement": state["fsm"].engagement_state,
-        "conversation": state["conv"].conversation_state
-    }
+    state = USER.setdefault(user_id, {"conversation": []})
 
     # 1) Router LLM → analysis JSON
     try:
-        analysis = call_router(user_id, user_msg, last_states)
-        app.logger.info(f"router_ok uid={user_id} conv_target={(analysis.get('conversation',{}) or {}).get('state')}")
+        analysis = call_router(user_id, user_msg)
+        app.logger.info(f"router_ok uid={user_id}")
     except Exception as e:
         app.logger.exception("router_llm_failed")
         return jsonify({"error": "router_llm_failed", "details": str(e)}), 500
 
-    # 2) Persist memories & diffs
+    # 2) Persist memories
     # Semantic (upsert light facts)
     for s in analysis.get("memories", {}).get("semantic", []):
         doc = {"user_id": user_id, "type": s["type"], "value": s.get("value")}
@@ -669,34 +562,7 @@ def chat():
             pass
         col_episodic.insert_one(edoc)
 
-    # Diff (state change log from router JSON)
-    for d in analysis.get("memories", {}).get("diff", []):
-        d["user_id"] = user_id
-        d["time"] = datetime.utcnow()
-        col_diff.insert_one(d)
-
-    # 3) Apply FSM targets from analysis JSON
-    fsm = analysis.get("fsm", {})
-    state["fsm"].apply(fsm.get("emotion", "neutral"), fsm.get("engagement", "engaged"))
-
-    # Apply ConversationFSM (with crisis override) and log diff
-    prev_conv = state["conv"].conversation_state
-    conv_target = ((analysis.get("conversation", {}) or {}).get("state") or "casual_chat")
-    if analysis.get("crisis", {}).get("flag"):
-        conv_target = "crisis_support"
-    if conv_target not in CONV_STATES:
-        conv_target = "casual_chat"
-    if prev_conv != conv_target:
-        col_diff.insert_one({
-            "user_id": user_id,
-            "time": datetime.utcnow(),
-            "kind": "conversation_state_change",
-            "from": prev_conv,
-            "to": conv_target
-        })
-    state["conv"].apply(conv_target)
-
-    # 4) Crisis short-circuit
+    # 3) Crisis short-circuit
     cr = analysis.get("crisis", {"flag": False, "type": "none"})
     if cr.get("flag"):
         app.logger.warning(f"crisis_detected uid={user_id} type={cr.get('type')}")
@@ -707,16 +573,11 @@ def chat():
         return jsonify({
             "message": message,
             "meta": {
-                "crisis": cr,
-                "fsm": {
-                    "emotion": state["fsm"].emotion_state,
-                    "engagement": state["fsm"].engagement_state
-                },
-                "conversation": state["conv"].conversation_state
+                "crisis": cr
             }
         })
 
-    # 5) Build grounded prompt & query Ollama
+    # 4) Build grounded prompt & query Ollama
     mem_lines = retrieve_memories(user_id, user_msg, k=3)
 
     # Bring in a couple of relevant KB snippets (neutral KB)
@@ -733,7 +594,7 @@ def chat():
         if conv[i]["role"] == "user" and conv[i + 1]["role"] == "assistant":
             tail.append({"u": conv[i]["text"], "a": conv[i + 1]["text"]})
 
-    prompt = build_companion_prompt(user_id, user_msg, analysis, mem_lines, tail)
+    prompt = build_companion_prompt(user_id, user_msg, mem_lines, tail)
 
     try:
         raw = ollama_generate(prompt)
@@ -745,19 +606,15 @@ def chat():
     # Normalize to a single message regardless of model quirks
     message = extract_message(raw)
 
-    # 6) Log conversation
+    # 5) Log conversation
     state["conversation"].append({"role": "user", "text": user_msg})
     state["conversation"].append({"role": "assistant", "text": message})
 
-    app.logger.info(f"/chat done uid={user_id} mode={state['conv'].conversation_state} emo={state['fsm'].emotion_state} eng={state['fsm'].engagement_state}")
+    app.logger.info(f"/chat done uid={user_id}")
     return jsonify({
         "message": message,
         "meta": {
-            "fsm": {
-                "emotion": state["fsm"].emotion_state,
-                "engagement": state["fsm"].engagement_state
-            },
-            "conversation": state["conv"].conversation_state
+             "analysis": analysis # Optionally return the router analysis
         }
     })
 
