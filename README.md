@@ -1,91 +1,92 @@
-# Obvix Wellness (made by Obvix Labs)
+# Obvix Wellness by Obvix Labs 
 
-An experimental, safety-first emotional chat companion. Backend is a Flask API with lightweight RAG (MongoDB), a Gemini 2.5 Flash router for state analysis and embeddings that support memories, and an Ollama-served local chat model. Trained adapters and a 4-bit quantized prototype are available on Hugging Face.
+**Obvix Wellness** is an experimental emotional chat companion with a strong emphasis on safety, designed and built by Obvix Labs. It integrates a Flask backend API, advanced hybrid retrieval augmented generation (RAG) using MongoDB, Google Gemini 2.5 Flash router for detailed state analysis, and a local Ollama-served chat model, all orchestrated to provide sensitive, therapeutic-style responses.
 
-Important: This prototype is not medical advice and not a replacement for professional care.
+***
 
+## Project Overview
 
+- **Project Name:** Obvix Wellness  
+- **Organization:** Obvix Labs  
+- **Model Hubs:**  
+  - Instruction-tuned adapter: [hf.co/thtskaran/emoai](https://hf.co/thtskaran/emoai)  
+  - Pretrained adapter (PT base): [hf.co/thtskaran/ob-wl-g3-pt](https://hf.co/thtskaran/ob-wl-g3-pt)  
+- **Disclaimer:** This prototype is *not medical advice* nor a substitute for professional care. All safety logic should be validated before real user deployment.
 
-## Using the Ollama Modelfile
+***
 
-- ollama create emoai-sarah -f training/Modelfile
-- ollama run emoai-sarah
+## Key Components & Architecture
 
-Notes:
-- The Modelfile pulls from hf.co/thtskaran/emoai. Ensure your GPU/CPU meets requirements for the chosen GGUF.
-- Stop tokens and a lightweight Alpaca-style template are pre-configured.
+- **Backend API:** Flask  
+- **Database:** MongoDB (stores chat history, semantic and episodic memories, therapeutic knowledge base chunks)  
+- **Router and Embeddings:** Google Gemini 2.5 Flash for conversation state analysis and embedding generation  
+- **Local Chat Model Serving:** **Ollama (mandatory)** with custom Modelfiles supporting lightweight, quantized LoRA adapters  
+- **Models:**  
+  - LoRA adapters and quantized GGUF models optimized for efficient inference hosted on Hugging Face  
+  - Alpaca-style templates and stop tokens are pre-configured  
+- **Hybrid Retrieval:** Combines cosine similarity with BM25, enhanced with topic bias towards therapeutic guideline content (primarily CBT/DBT)  
+- **Therapeutic Knowledge Base:** Implemented using Google Drive files as an optional, automatically syncable source of therapy-related documents and rulebooks  
 
-## Training summary
+***
 
-- Data: ~14,000 conversation rows
-- Method: Unsloth LoRA fine-tuning on Google Colab A100
-- Duration: ~3 hours end-to-end (prep + SFT)
-- Key stack:
-  - Unsloth FastLanguageModel for efficient 4-bit load + LoRA
-  - TRL SFTTrainer with packing and assistant-only loss
-  - Early stopping and cosine scheduler
-- Artifacts:
-  - LoRA adapters pushed to: https://hf.co/thtskaran/emoai
-  - A prototype 4-bit .gguf for easy inference via llama.cpp/Ollama
+## Runtime Flow
 
-Important compatibility note:
-- Always merge a LoRA with the same base model family it was trained on.
-- If you change base families (e.g., from Llama to Gemma), retrain or use matching adapters.
+1. User sends a `POST /chat` request with JSON `{ user_id, message }`.  
+2. The message is logged into MongoDB chat history.  
+3. Router LLM (Gemini 2.5 Flash) performs:  
+   - Crisis detection (suicidality, psychosis, abuse, dysregulation)  
+   - Extraction of semantic and episodic memories  
+   - Sentiment, emotion, sarcasm, and volatility analysis  
+4. Messages flagged as crisis bypass the full pipeline and receive a predefined compassionate response template immediately.  
+5. For regular messages, hybrid retrieval fetches contextual memories and optional therapeutic knowledge base chunks from Google Drive (if configured), weighted by relevance and CBT/DBT topic boost.  
+6. The local Ollama-served chat model receives a structured JSON prompt including memories, retrieved KB, and emotion summaries, then generates a JSON response.  
+7. The assistant reply is saved and returned to the user.  
 
-## Merging and quantization (notebook flow)
+**Note:** The router LLM currently performs a single call per message. Future plans involve batching to reduce API calls and latency.
 
-- Loading a base model and training LoRA with Unsloth.
-- Merging LoRA into base weights (Peft merge_and_unload).
-- Converting merged HF weights to GGUF via llama.cpp.
-- Optional quantization (e.g., Q4_K_M).
-- Uploading GGUF back to the HF repo.
+***
 
-If you only want to infer locally:
-- Use the provided Modelfile with Ollama (see above).
-- Or directly download the GGUF from the HF repo.
+## Installation & Setup
 
+### System Requirements
 
-## License
+- Python 3.10+  
+- MongoDB 6.x+ for persistent storage  
+- Outbound HTTPS access for Google API (embeddings, router)  
+- **Ollama installation and run** is *mandatory* for local chat model inference  
 
-- Content and model artifacts in this project are released under CC BY-NC-SA (Attribution-NonCommercial-ShareAlike).
-- You may remix and share non-commercially with attribution and the same license. Commercial use requires separate permission.
+### Installation (Ubuntu example)
 
-## Acknowledgments
-
-- Unsloth, TRL, Transformers, llama.cpp
-- Hugging Face Hub (hosting adapters and GGUF)
-- Google AI Studio (Gemini) for routing and embeddings
-- Google Drive API
-- Community models used in prototyping
-
-## Project
-
-- Name: Obvix Wellness (made by Obvix Labs)
-- HF model hub: https://hf.co/thtskaran/emoai
-
-## Quick Start
-
-1. Install system deps (Ubuntu example)
-   - sudo apt update && sudo apt install -y python3-dev python3-venv build-essential
-   - Install and start MongoDB (or point to remote cluster)
-
-2. Clone & set up
-   - python3 -m venv .venv && source .venv/bin/activate
-   - pip install --upgrade pip
-   - pip install flask pymongo python-dotenv transformers google-api-python-client google-auth pypdf python-docx
-
-3. (Optional) Pull / run Ollama model
-   - Install Ollama: https://ollama.ai
-   - ollama pull gemma3:12b  (or your custom fine-tuned model)
-   - Ensure it matches CHAT_MODEL in app.py
-
-4. Create .env (see below), then:
-   - python app.py
-   - Server: http://localhost:5001
-
-## .env Example
-
+```bash
+sudo apt update && sudo apt install -y python3-dev python3-venv build-essential
 ```
+
+### Set up environment and dependencies
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install --upgrade pip
+pip install flask pymongo python-dotenv transformers google-api-python-client google-auth pypdf python-docx
+```
+
+### Ollama Model Serving
+
+- Ollama is a **required** dependency to run any chat model inference. No alternative serving mechanism is currently supported.  
+- Load Modelfiles tailored for your chosen model:  
+  Example to set up the Pretrained (PT) model:  
+  ```bash
+  ollama create ob-wl-pt -f training/Modelfile-pt
+  ollama run ob-wl-pt
+  ```
+- The PT Modelfile directs the model with concise therapeutic instructions avoiding excess sycophancy, resulting from skipping heavy RLHF phases. It works best embedded in the full orchestration with router logic rather than standalone chat.
+
+***
+
+## Environment Variable Configuration
+
+Example `.env` file:
+
+```ini
 GEMINI_KEY=YOUR_GEMINI_API_KEY
 OLLAMA_URL=http://127.0.0.1:11434
 MONGODB_URI=mongodb://localhost:27017
@@ -94,7 +95,7 @@ LOG_FILE=logs.log
 PORT=5001
 FLASK_DEBUG=1
 
-# Optional Knowledge Base (Google Drive)
+# Therapeutic Knowledge Base (Google Drive KB)
 GDRIVE_FOLDER_ID=
 GOOGLE_CREDENTIALS_PATH=client.json
 
@@ -102,263 +103,72 @@ GOOGLE_CREDENTIALS_PATH=client.json
 KB_OVERLAP=0
 KB_TOPK=3
 MEMORY_TOPK=5
+CHUNK_SIZE=1500
+
+# Model and API configuration
+EMBED_MODEL=gemini-embedding-001
+ROUTER_MODEL=gemini-2.5-flash
+CHAT_MODEL=ob-wl-pt
+MAX_TOKENS=135
 ```
 
-## Architecture Overview (Runtime Flow)
+***
 
-1. User POSTs /chat with { user_id, message }.
-2. Message stored in chat_history.
-3. Gemini Router (ROUTER_MODEL) called → returns JSON:
-   - crisis flag + type
-   - semantic memory candidates (facts: name, preference, relation, profession)
-   - episodic summaries
-4. Semantic + episodic memories stored (with on-demand embeddings).
-5. Crisis shortcut: if flagged → immediate compassionate template reply.
-6. Context building:
-   - Memory retrieval: hybrid (0.6 * cosine + 0.4 * BM25) with threshold.
-   - KB retrieval: hybrid (0.5 * cosine + 0.2 * BM25 + topic_boost) with strong CBT/DBT topic bias.
-   - Emotion + volatility summary (sentiment EMA + emotion + sarcasm).
-7. Prompt assembled as structured JSON inside AASHA_SYS instructions.
-8. Local Ollama model (CHAT_MODEL) generates JSON {"message": "..."}.
-9. Assistant reply stored and returned.
+## Model Training & Artifact Summary
 
-## Mongo Collections
+### Instruction-Tuned Adapter (Gemma3-4b base)
 
-- chat_history: {user_id, role, text, time}
-- semantic_memory: stable user facts (+ embedding)
-- episodic_memory: short event summaries (+ embedding)
-- kb_sources: metadata per Drive file
-- kb_chunks: chunked text + embedding + tags
-- settings: internal state (e.g., Drive changes page token)
+- Trained on roughly 14,000 therapeutic conversation rows  
+- LoRA fine-tuning done with Unsloth FastLanguageModel and TRL SFTTrainer with assistant-only loss  
+- Early stopping and cosine learning rate scheduler in use  
+- Validation perplexity: 1.5503 after 3 epochs  
+- Artifacts available: LoRA adapters, 4-bit GGUF models, and Modelfile for Ollama deployment at [hf.co/thtskaran/emoai](https://hf.co/thtskaran/emoai)  
 
-Indexes auto-created on startup:
-- chat_history: (user_id, time)
-- semantic_memory: user_id
-- episodic_memory: user_id
-- kb_chunks: source_id
+### Pretrained Adapter (Gemma3-4b PT base)
 
-## Retrieval Details
+- Skips resource-heavy RLHF phase to reduce sycophantic behavior, promoting groundedness  
+- Validation perplexity: 1.7113  
+- LoRA adapters and 8-bit GGUF models with Modelfile provided, hosted at [hf.co/thtskaran/ob-wl-g3-pt](https://hf.co/thtskaran/ob-wl-g3-pt)  
+- Best used embedded within orchestration; no standalone direct chat Modelfile provided for PT adapter  
+- Future work planned to fine-tune adapters on broader conversational datasets for improved chat style and generalization
 
-Memory:
-- Hybrid score = 0.6 cosine + 0.4 BM25
-- Filter threshold > 0.1
-- Returns top K (MEMORY_TOPK env)
+***
 
-Knowledge Base:
-- Chunks embedded at ingestion
-- Topic detection (CBT/DBT phrases) adds 0.4 * matches to score
-- Score = 0.5 cosine + 0.2 BM25 + topic_boost
-- Returns KB_TOPK
+## Therapeutic Knowledge Base (Google Drive)
 
-Chunking:
-- CHUNK_SIZE = 1500 chars
-- Overlap configurable via KB_OVERLAP (default 0)
+- Optional integration of a therapeutic knowledge base via Google Drive documents shared with a service account  
+- Auto syncs via Drive Changes API in an incremental background thread: uploads, modifications, deletions reflected in knowledge chunks and embeddings  
+- Documents chunked (~1500 characters plus configurable overlap), embedded with Gemini embeddings, stored in MongoDB  
+- Retrieval weighted heavily towards CBT/DBT relevant content with topic boost factors  
+- Drives therapy-specific guidance and contextual facts into the chat interaction
 
-## Emotion & Velocity
+***
 
-- Sentiment model (twitter-roberta) → normalized scalar sequence
-- Exponential moving average of absolute deltas → volatility bucket
-- Emotion classifier selects primary label (confidence > 0.4)
-- Sarcasm detector optional (score > 0.6)
-- Output: single sentence summary consumed by model
+## Current Limitations & Roadmap
 
-## Crisis Handling
+- Fully reactive system currently; ongoing work to evolve proactive, intent-aware, and safety-layered orchestration  
+- Planned improvements include:  
+  - Autonomous topic detection replacing keyword heuristics with zero-shot classification  
+  - Classical ML model pre-filter for fast crisis detection (shadow mode initially)  
+  - Intent classification for routing (small-talk, information requests, therapeutic inquiries, personal questions)  
+  - Dynamic retrieval policy adjustments post-intent classification  
+  - Rolling online adaptation smoothing user mood and intent signals  
+  - Batch request support for router LLM calls to lower latency and cost  
+  - Migration to advanced vector DB backends (Qdrant/Weaviate)  
+  - Enhanced safety features: NSFW classifiers, red-team phrase matchers, model guardrails  
+  - Dynamic model selection depending on conversation context and type  
+  - Periodic embedding backfill jobs for legacy data and model upgrades  
+  - Improved hyperparameter tuning and multi-domain chat data-adapter training  
 
-Router sets crisis.flag only for imminent signals (suicidality, psychosis, abuse, dysregulation).
-If true → bypass full generation → predefined compassionate template reply.
+***
 
-## Google Drive Knowledge Sync (Optional)
+## Contribution & Contact
 
-1. Provide service account JSON at GOOGLE_CREDENTIALS_PATH.
-2. Share target folder with service account email.
-3. Set GDRIVE_FOLDER_ID.
-4. Background thread (watch_drive_changes_loop):
-   - Uses Drive Changes API incremental polling
-   - On change: re-chunks file, re-embeds, upserts
-   - On removal/trashed: deletes related kb_chunks
+Contributors and collaborators are invited to participate and help evolve Obvix Wellness.
 
-## Endpoint
+- Please open Pull Requests on the code repositories, or  
+- Contact directly via email: [hello@Karanprasad.com](mailto:hello@Karanprasad.com)
 
-POST /chat
-Request:
-```
-{
-  "user_id": "user123",
-  "message": "I keep catastrophizing before meetings."
-}
-```
+***
 
-Success Response:
-```
-{
-  "message": "You’ve been really hard on yourself before meetings. Want to look at one thought together and gently reframe it?",
-  "meta": {
-    "analysis": {
-      "crisis": {"flag": false, "type": "none"},
-      "memories": { "semantic": [...], "episodic": [...] }
-    }
-  }
-}
-```
-
-Error Response:
-```
-{ "error": "router_llm_failed", "details": "..." }
-```
-
-## Logging
-
-- Main rotating log: LOG_FILE (default logs.log)
-- Structured trace: test.txt (chat_trace logger)
-- Each step annotated: router_call_start, kb_retrieval_done, ollama_call_ok, etc.
-
-## Embeddings
-
-- Gemini embedding endpoint model: gemini-embedding-001
-- Failures gracefully degrade (memory retrieval still uses BM25 portion)
-
-## Local Model (Ollama)
-
-- CHAT_MODEL = gemma3:12b (change via env if desired)
-- Must return JSON; fallback regex extraction if malformed
-- Adjust temperature etc. by modifying payload in ollama_generate
-
-## Safety & Limitations
-
-- Not a diagnostic or therapeutic system.
-- No PII redaction implemented—deploy behind controlled access.
-- Crisis detection heuristic depends on router model quality.
-
-## Example curl
-
-```
-curl -X POST http://localhost:5001/chat \
-  -H "Content-Type: application/json" \
-  -d '{"user_id":"u1","message":"I feel overwhelmed and keep overthinking"}'
-```
-
-## Troubleshooting
-
-- 500 router_llm_failed: Check GEMINI_KEY validity / quota.
-- ollama_failed: Ensure model pulled and Ollama daemon running.
-- context_retrieval_failed: Often embedding call/network; check connectivity.
-- No KB results: Confirm Drive folder shared & service account permissions.
-- High latency: Reduce KB_TOPK / MEMORY_TOPK or switch to smaller local model.
-
-## Minimal Requirements
-
-- Python 3.10+
-- MongoDB 6.x+
-- Outbound HTTPS to Google APIs (embeddings + router)
-- Optional: Ollama GPU or CPU capacity for selected model
-
-## Extending
-
-- Add new topic tags in detect_guideline_topics
-- Swap in vector DB (e.g., Qdrant) by replacing retrieval sections
-- Add rate limiting or auth in Flask before_request
-
-## Disclaimer
-
-Prototype only. Not a substitute for professional help. Verify all safety logic before any real user exposure.
-
-## Future Scope (Planned Enhancements)
-
-### 1. Autonomous Topic Detection (Replacing Keyword Heuristics)
-Current: detect_guideline_topics uses keyword lists.
-Planned: Zero-shot classification to infer CBT / DBT relevance even without explicit terms.
-
-Example (future replacement):
-```python
-from transformers import pipeline
-try:
-    topic_clf = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-except Exception:
-    topic_clf = None
-
-def detect_guideline_topics_autonomous(text: str):
-    if not topic_clf:
-        return []
-    labels = ["cognitive behavioral therapy", "dialectical behavior therapy"]
-    try:
-        res = topic_clf(text, labels, multi_label=True)
-        out = []
-        for label, score in zip(res["labels"], res["scores"]):
-            if score > 0.40:
-                if "cognitive" in label: out.append("cbt")
-                elif "dialectical" in label: out.append("dbt")
-        return list(set(out))
-    except Exception:
-        return []
-```
-Fallback: retain existing keyword function as backup if model unavailable.
-
-Impact:
-- Higher recall on distorted thinking descriptions
-- Cleaner KB retrieval biasing
-
-### 2. Classical ML Crisis Pre-Filter
-Add a fast Logistic Regression (or linear SVM) that runs before router:
-Features:
-- TF-IDF of message
-- Counts of high-risk lexicon
-- Sentiment scalar + (optional) top emotion score
-Action:
-- If probability > threshold (e.g., 0.65) → tag message and force crisis-sensitive branch (still confirm via router).
-Benefits: Lower latency early detection; layered safety.
-
-### 3. Intent Pre-Router (Efficiency Layer)
-Multiclass Naive Bayes over intents:
-- therapeutic_inquiry
-- personal_question
-- information_request
-- small_talk
-Routing Policy (example):
-- small_talk → skip KB + memory retrieval (fast path)
-- personal_question → prioritize memory retrieval
-- information_request → emphasize KB
-- therapeutic_inquiry → full pipeline (current behavior)
-
-Pseudo-hook (future in /chat start):
-```python
-intent = intent_model.predict([user_msg])[0]
-if intent == "small_talk":
-    # build minimal prompt (no retrieval) → generate
-```
-
-### 4. Adjustable Retrieval Policies
-After intent classification:
-- Dynamically set KB_TOPK / MEMORY_TOPK
-- Potential caching of embeddings for repeated short-talk sessions
-
-### 5. Lightweight Online Adaptation
-Store rolling intent/mood distributions per user for:
-- Temporal smoothing (e.g., volatility trend)
-- Adaptive thresholds (e.g., lower crisis trigger after escalating language spikes)
-
-### 6. Evaluation & Monitoring
-Planned:
-- Confusion matrix logging for crisis pre-filter (shadow mode first)
-- Intent distribution dashboard
-- Drift alerts: sudden drop in zero-shot topic assignment rates
-
-### 7. Optional Vector DB Migration
-Abstract current Mongo retrieval layer to allow plugging Qdrant / Weaviate for:
-- ANN search
-- Filtering by tags + hybrid scoring server-side
-
-### 8. Safety Hardening
-- Add prompt guardrail classifier (NSFW / disallowed)
-- Red-team phrase pattern matcher before LLM call
-
-### 9. Model Selection Strategy
-Future: dynamic CHAT_MODEL swap:
-- Smaller model for small_talk
-- Larger / safer model for crisis-adjacent or therapeutic_inquiry
-
-### 10. Batch Embedding Backfill
-Periodic job to:
-- Recompute embeddings for legacy semantic / episodic rows with missing vectors
-- Normalize embedding dimensionality after model upgrade
-
-These upgrades transition the system from reactive keyword heuristics to proactive, intent-aware, safety-layered orchestration while controlling latency and cost.
+This project aims to advance a safe, emotionally intelligent AI companion integrating real-time retrieval, advanced conversational orchestration, and continuous research to improve groundedness and therapeutic efficacy.
