@@ -42,7 +42,8 @@ CHUNK_SIZE              = 1500
 
 EMBED_MODEL   = "gemini-embedding-001"
 ROUTER_MODEL  = "gemini-2.5-flash"
-CHAT_MODEL    = "emoai-sarah"
+CHAT_MODEL    = "ob-wl-pt"
+MAX_TOKENS    = int(os.getenv("MAX_TOKENS", "135"))
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
@@ -215,7 +216,7 @@ def retrieve_relevant_memories(user_id: str, query_text: str, k=MEMORY_TOPK):
 
 AASHA_SYS = (
     "You are Aasha — a warm, grounded, everyday chat companion. "
-    "Talk naturally with the user like a supportive friend. Keep replies concise and human. "
+    "Talk naturally with the user like a supportive friend. Keep replies to 1–2 short sentences (max 40 words total). "
     "You will receive structured context.\n\n"
     "INPUTS YOU MAY RECEIVE:\n"
     "- chat_history: the last 5 turns as a JSON list of {user, assistant} pairs (most-recent last).\n"
@@ -224,6 +225,7 @@ AASHA_SYS = (
     "- kb_snippets: short, relevant knowledge snippets from clinical handbooks (e.g., CBT, DBT) to help you provide supportive, informed guidance.\n\n"
     "BEHAVIOR:\n"
     "- Be friendly, succinct, and real; avoid clinical tone, but you can use concepts from the kb_snippets if they seem helpful.\n"
+    "- If user_input is just a greeting or very short, reply with a warm hello and one brief question; do not give advice.\n"
     "- Use memories and history for continuity. If a memory about a specific person is retrieved, it's a strong signal they are important right now.\n"
     "- Adapt your tone based on the emotion_analysis. If the user's state is volatile, be extra calm and grounding.\n"
     "- Ask at most one brief clarifying question only if needed.\n"
@@ -429,7 +431,15 @@ def build_companion_prompt(user_id, user_message, kb_snippets, relevant_memories
 
 def ollama_generate(prompt: str):
     url = f"{OLLAMA_URL}/api/generate"
-    payload = {"model": CHAT_MODEL, "prompt": prompt, "stream": False}
+    payload = {
+        "model": CHAT_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": MAX_TOKENS,
+            "temperature": 0.2
+        }
+    }
     r = requests.post(url, json=payload, timeout=60)
     r.raise_for_status()
     try:
@@ -439,16 +449,80 @@ def ollama_generate(prompt: str):
         return r.text.strip()
 
 def extract_message(raw: str) -> str:
+    s = (raw or "").strip()
     try:
-        data = json.loads(raw)
-        message = data.get("message", "")
-        if message: return message
-    except json.JSONDecodeError:
-        match = re.search(r'\{.*?"message"\s*:\s*"(.*?)".*?\}', raw, re.DOTALL)
+        # Strip code fences if present
+        if s.startswith("```"):
+            s = re.sub(r"^```[a-zA-Z0-9]*\n", "", s)
+            s = re.sub(r"\n```$", "", s).strip()
+
+        # Try parsing JSON directly
+        data = None
+        try:
+            data = json.loads(s)
+        except Exception:
+            data = None
+
+        # Case 1: JSON object
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("text") or ""
+            if isinstance(msg, str) and msg.strip():
+                return msg.strip()
+
+        # Case 2: JSON was a string (possibly JSON-encoded again)
+        if isinstance(data, str):
+            inner = data.strip()
+            try:
+                inner_obj = json.loads(inner)
+                if isinstance(inner_obj, dict) and "message" in inner_obj:
+                    return str(inner_obj.get("message", "")).strip()
+            except Exception:
+                if inner:
+                    return inner
+
+        # Fallback: regex for message field (handles "message": "..." or 'message': '...')
+        match = re.search(r'["\']message["\']\s*:\s*["\'](.*?)["\']', s, re.DOTALL)
         if match:
             return match.group(1).strip()
-    return raw.strip().replace("Aasha:", "").strip()
 
+        # Final fallback: plain text, remove any "Aasha:" prefix
+        return s.replace("Aasha:", "").strip()
+    except Exception:
+        # Never raise from extractor
+        return s.replace("Aasha:", "").strip()
+
+# Enforce brevity and detect low-content greetings
+def enforce_brevity(text: str, max_words: int = 40, max_sentences: int = 2) -> str:
+    if not text:
+        return text
+    norm = re.sub(r"\s+", " ", text).strip()
+    # Keep at most max_sentences
+    sentences = re.split(r"(?<=[.!?])\s+", norm)
+    clipped = " ".join(sentences[:max_sentences])
+    # Then cap by words
+    words = clipped.split()
+    if len(words) > max_words:
+        clipped = " ".join(words[:max_words]).rstrip(",;:") + "..."
+    return clipped
+
+def is_low_content_greeting(text: str) -> bool:
+    if not text:
+        return False
+    s = re.sub(r"[\s\W_]+", " ", text.strip().lower()).strip()
+    if not s:
+        return False
+    greetings = {
+        "hi", "hey", "hello", "yo", "heya", "hiya", "hey there", "hola",
+        "sup", "whats up", "what's up", "good morning", "good afternoon", "good evening"
+    }
+    if s in greetings:
+        return True
+    tokens = s.split()
+    if len(tokens) <= 3 and any(g in s for g in greetings):
+        # Treat as greeting if there isn't clear problem content
+        if not any(k in s for k in ["help", "issue", "problem", "because", "anxious", "stress", "sad", "angry", "sister"]):
+            return True
+    return False
 
 @app.route("/chat", methods=["POST"])
 def chat():
@@ -463,7 +537,22 @@ def chat():
     chat_trace(user_id, "request_received", {"msg_len": len(user_msg)})
 
     col_chat_history.insert_one({"user_id": user_id, "role": "user", "text": user_msg, "time": datetime.utcnow()})
-    
+
+    # Greeting short-circuit: keep it friendly and very brief
+    if is_low_content_greeting(user_msg):
+        try:
+            name_doc = col_semantic.find_one({"user_id": user_id, "type": "name"})
+            first_name = None
+            if name_doc:
+                v = str(name_doc.get("value", "")).strip()
+                first_name = v.split()[0] if v else None
+        except Exception:
+            first_name = None
+        msg = f"Hey {first_name}! How are you doing today?" if first_name else "Hey! How are you doing today?"
+        col_chat_history.insert_one({"user_id": user_id, "role": "assistant", "text": msg, "time": datetime.utcnow()})
+        chat_trace(user_id, "greeting_short_circuit", {})
+        return jsonify({"message": msg, "meta": {"short_circuit": "greeting"}})
+
     # 1) Router LLM → analysis JSON
     chat_trace(user_id, "router_call_start", {"model": ROUTER_MODEL})
     try:
@@ -534,6 +623,11 @@ def chat():
         raw_response = ollama_generate(prompt)
         chat_trace(user_id, "ollama_call_ok", {"raw_chars": len(raw_response)})
         message = extract_message(raw_response)
+        if not message:
+            # Safe fallback to avoid 500s when model output is malformed
+            message = "I’m here with you. Tell me a bit more so I can help."
+        # Enforce brevity regardless of model behavior
+        message = enforce_brevity(message, max_words=40, max_sentences=2)
         chat_trace(user_id, "message_extracted", {"chars": len(message)})
     except Exception as e:
         chat_trace(user_id, "ollama_call_failed", {"error": str(e)})
