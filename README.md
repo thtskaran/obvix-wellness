@@ -10,8 +10,10 @@
 * **Organization:** Obvix Labs
 * **Model Hubs:**
 
-  * Instruction-tuned adapter: [hf.co/thtskaran/emoai](https://hf.co/thtskaran/emoai)
-  * Pretrained adapter (PT base): [hf.co/thtskaran/ob-wl-g3-pt](https://hf.co/thtskaran/ob-wl-g3-pt)
+  * Adapters Trained On it(Instruction-tuned) Base Model: [hf.co/thtskaran/emoai](https://hf.co/thtskaran/emoai)
+  * Adapters Trained On pt(Pre-Trained) Base Model: [hf.co/thtskaran/ob-wl-g3-pt](https://hf.co/thtskaran/ob-wl-g3-pt)
+
+  `gemma3:4b` was our base model.
 * **Disclaimer:** This prototype is *not medical advice* nor a substitute for professional care. All safety logic should be validated before real user deployment.
 
 ---
@@ -20,8 +22,8 @@
 
 * **Backend API:** Flask
 * **Database:** MongoDB (stores chat history, semantic and episodic memories, therapeutic knowledge base chunks)
-* **Router and Embeddings:** Google Gemini 2.5 Flash for conversation state analysis and embedding generation
-* **Local Chat Model Serving:** **Ollama (mandatory)** with custom Modelfiles supporting lightweight, quantized LoRA adapters
+* **Router and Embeddings:** Google Gemini 2.5 Flash for conversation state analysis and `gemini-embedding-001` for embedding generation
+* **Local Chat Model Serving:** **Ollama (mandatory)** with custom Modelfiles supporting lightweight, quantized models
 * **Models:**
 
   * LoRA adapters and quantized GGUF models optimized for efficient inference hosted on Hugging Face
