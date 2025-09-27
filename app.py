@@ -68,7 +68,7 @@ setup_logging(app)
 chat_logger = logging.getLogger("chat_trace")
 if not chat_logger.handlers:
     chat_logger.setLevel(logging.INFO)
-    _test_log_path = os.path.join(os.path.dirname(__file__), "test.txt")
+    _test_log_path = os.path.join(os.path.dirname(__file__), "prompts.log")
     try:
         fh = logging.FileHandler(_test_log_path)
         fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
@@ -437,7 +437,7 @@ def ollama_generate(prompt: str):
         "stream": False,
         "options": {
             "num_predict": MAX_TOKENS,
-            "temperature": 0.2
+            "temperature": 0.7
         }
     }
     r = requests.post(url, json=payload, timeout=60)

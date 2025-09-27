@@ -330,9 +330,9 @@ $$
 
 ---
 
-### Environment Variables (Extended)
+### Environment Variables (Brief Explaination)
 
-Already documented vars remain valid; the app also reads/uses:
+
 
 * **Core**
 
@@ -357,11 +357,11 @@ Already documented vars remain valid; the app also reads/uses:
   * `KB_OVERLAP` (default `0`)
   * `KB_TOPK` (default `3`)
   * `MEMORY_TOPK` (default `5`)
-  * `CHUNK_SIZE` (fixed at 1500 by code; expose here for clarity)
+  * `CHUNK_SIZE` (fixed at 1500 by code;)
 
 * **Logging**
 
-  * `LOG_FILE` (default `<repo>/logs.log`)
+  * `LOG_FILE` (default `<repo>/logs.log` `/prompts.log` (for model-prompt analysis))
 
 ---
 
